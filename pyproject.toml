@@ -36,7 +36,9 @@ dependencies = [
 Repository = "https://github.com/tokenbender/mHC-manifold-constrained-hyper-connections"
 
 [project.optional-dependencies]
-examples = []
+examples = [
+    "huggingface-hub>=0.20.0",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

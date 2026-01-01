@@ -1,11 +1,37 @@
+"""
+Training script for nanoGPT with HyperConnections.
+
+Supports:
+- Single GPU or multi-GPU via torchrun
+- bf16/fp16 AMP
+- Shakespeare char-level (legacy) or FineWeb token-level data
+
+Usage:
+    # Single GPU, Shakespeare
+    python train.py config/train_shakespeare_char.py
+
+    # Single GPU, FineWeb
+    python train.py config/train_fineweb10B.py
+
+    # Multi-GPU (4x), FineWeb
+    torchrun --standalone --nproc_per_node=4 train.py config/train_fineweb10B.py
+"""
+
+import glob
 import json
 import math
 import os
 import time
+from contextlib import nullcontext
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from model import GPT, GPTConfig
+
+# -----------------------------------------------------------------------------
+# default config values (can be overridden by config file)
 
 out_dir = "out"
 eval_interval = 200
@@ -26,6 +52,7 @@ learning_rate = 3e-4
 weight_decay = 0.1
 beta1 = 0.9
 beta2 = 0.95
+grad_clip = 1.0
 
 warmup_iters = 200
 lr_decay_iters = 2000
@@ -35,31 +62,157 @@ gradient_accumulation_steps = 1
 
 seed = 1337
 
+# dataset: "shakespeare_char" or "fineweb10B"
 dataset = "shakespeare_char"
 
+# hyper-connections config
 hc_num_streams = 1
 hc_num_fracs = 1
 hc_disable = True
 
+# dtype: "float32", "bfloat16", "float16"
+dtype = "bfloat16"
+
+# torch.compile (requires PyTorch 2.0+)
+compile_model = False
+
+# -----------------------------------------------------------------------------
+# load config file if provided
 exec(open(os.path.join(os.path.dirname(__file__), "configurator.py")).read())
 
-torch.manual_seed(seed)
+# -----------------------------------------------------------------------------
+# DDP setup
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-device_type = "cuda" if device == "cuda" else "cpu"
+ddp = int(os.environ.get("RANK", -1)) != -1
+
+if ddp:
+    dist.init_process_group(backend="nccl")
+    ddp_rank = int(os.environ["RANK"])
+    ddp_local_rank = int(os.environ["LOCAL_RANK"])
+    ddp_world_size = int(os.environ["WORLD_SIZE"])
+    device = f"cuda:{ddp_local_rank}"
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0
+    seed_offset = ddp_rank
+    assert gradient_accumulation_steps % ddp_world_size == 0
+    gradient_accumulation_steps //= ddp_world_size
+else:
+    master_process = True
+    seed_offset = 0
+    ddp_world_size = 1
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+torch.manual_seed(seed + seed_offset)
+device_type = "cuda" if "cuda" in device else "cpu"
+
+# -----------------------------------------------------------------------------
+# AMP setup
+
+ptdtype = {
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+}[dtype]
+
+if device_type == "cpu":
+    ctx = nullcontext()
+    scaler = None
+else:
+    ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+    # GradScaler only needed for float16
+    scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
+
+# -----------------------------------------------------------------------------
+# Data loading
 
 data_dir = os.path.join(os.path.dirname(__file__), "data", dataset)
-train_path = os.path.join(data_dir, "train.bin")
-val_path = os.path.join(data_dir, "val.bin")
-meta_path = os.path.join(data_dir, "meta.json")
 
-train_data = torch.load(train_path)
-val_data = torch.load(val_path)
+if dataset == "fineweb10B":
+    # FineWeb10B: pretokenized GPT-2 shards
+    # Format: 256 x int32 header, then uint16 tokens
+    # Header: [0]=magic(20240520), [1]=version(1), [2]=num_tokens
 
-with open(meta_path, "r") as f:
-    meta = json.load(f)
+    FINEWEB_MAGIC = 20240520
+    FINEWEB_VERSION = 1
+    HEADER_SIZE = 256  # int32 count
 
-vocab_size = meta["vocab_size"]
+    def load_fineweb_shard(path):
+        """Load a FineWeb shard, validate header, return tokens as int32 tensor."""
+        header = torch.from_file(
+            str(path), shared=False, size=HEADER_SIZE, dtype=torch.int32
+        )
+        assert header[0].item() == FINEWEB_MAGIC, f"bad magic in {path}"
+        assert header[1].item() == FINEWEB_VERSION, f"bad version in {path}"
+        num_tokens = header[2].item()
+
+        # read tokens (uint16 -> convert to int32 for embedding lookup)
+        tokens = torch.empty(num_tokens, dtype=torch.int32)
+        with open(path, "rb") as f:
+            f.seek(HEADER_SIZE * 4)  # skip header (256 * 4 bytes)
+            import numpy as np
+
+            buf = np.frombuffer(f.read(num_tokens * 2), dtype=np.uint16)
+            tokens[:] = torch.from_numpy(buf.astype(np.int32))
+
+        return tokens
+
+    # find shards
+    train_shards = sorted(glob.glob(os.path.join(data_dir, "fineweb_train_*.bin")))
+    val_shards = sorted(glob.glob(os.path.join(data_dir, "fineweb_val_*.bin")))
+
+    assert len(train_shards) > 0, f"no train shards found in {data_dir}"
+    assert len(val_shards) > 0, f"no val shards found in {data_dir}"
+
+    if master_process:
+        print(f"Found {len(train_shards)} train shards, {len(val_shards)} val shards")
+
+    # load all shards into memory (for simplicity; ~200MB per shard)
+    # for large-scale, would stream shards instead
+    train_data = torch.cat([load_fineweb_shard(s) for s in train_shards])
+    val_data = torch.cat([load_fineweb_shard(s) for s in val_shards])
+
+    if master_process:
+        print(f"Train tokens: {len(train_data):,}, Val tokens: {len(val_data):,}")
+
+    vocab_size = 50257  # GPT-2 vocab size
+
+else:
+    # Shakespeare char-level (legacy)
+    train_path = os.path.join(data_dir, "train.bin")
+    val_path = os.path.join(data_dir, "val.bin")
+    meta_path = os.path.join(data_dir, "meta.json")
+
+    train_data = torch.load(train_path)
+    val_data = torch.load(val_path)
+
+    with open(meta_path, "r") as f:
+        meta = json.load(f)
+
+    vocab_size = meta["vocab_size"]
+
+# -----------------------------------------------------------------------------
+# Batch sampling (simple random contiguous windows)
+
+
+def get_batch(split):
+    data = train_data if split == "train" else val_data
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+
+    x = torch.stack([data[i : i + block_size] for i in ix])
+    y = torch.stack([data[i + 1 : i + 1 + block_size] for i in ix])
+
+    if device_type == "cuda":
+        x = x.pin_memory().to(device, non_blocking=True)
+        y = y.pin_memory().to(device, non_blocking=True)
+    else:
+        x = x.to(device)
+        y = y.to(device)
+
+    return x, y
+
+
+# -----------------------------------------------------------------------------
+# Model setup
 
 model_config = GPTConfig(
     block_size=block_size,
@@ -77,22 +230,23 @@ model_config = GPTConfig(
 model = GPT(model_config)
 model.to(device)
 
-optimizer = model.configure_optimizers(
+if compile_model:
+    model = torch.compile(model)
+
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+
+raw_model = model.module if ddp else model
+
+optimizer = raw_model.configure_optimizers(
     weight_decay=weight_decay,
     learning_rate=learning_rate,
     betas=(beta1, beta2),
     device_type=device_type,
 )
 
-
-def get_batch(split):
-    data = train_data if split == "train" else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-
-    x = torch.stack([data[i : i + block_size] for i in ix])
-    y = torch.stack([data[i + 1 : i + 1 + block_size] for i in ix])
-
-    return x.to(device), y.to(device)
+# -----------------------------------------------------------------------------
+# Learning rate schedule
 
 
 def get_lr(it):
@@ -105,6 +259,11 @@ def get_lr(it):
     return min_lr + coeff * (learning_rate - min_lr)
 
 
+# -----------------------------------------------------------------------------
+# Evaluation
+
+
+@torch.no_grad()
 def estimate_loss():
     out = {}
     model.eval()
@@ -112,7 +271,7 @@ def estimate_loss():
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             x, y = get_batch(split)
-            with torch.no_grad():
+            with ctx:
                 _, loss = model(x, y)
             losses[k] = loss.item()
         out[split] = losses.mean().item()
@@ -120,16 +279,28 @@ def estimate_loss():
     return out
 
 
+# -----------------------------------------------------------------------------
+# Training loop
+
 iter_num = 0
 best_val_loss = 1e9
-loss = None
+
+if master_process:
+    print(f"Training on {device}, dtype={dtype}, DDP={ddp}")
+    if ddp:
+        print(
+            f"  world_size={ddp_world_size}, grad_accum_steps={gradient_accumulation_steps}"
+        )
+    print(f"  model params: {sum(p.numel() for p in model.parameters()):,}")
+    print()
 
 while iter_num <= max_iters:
     lr = get_lr(iter_num)
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr
 
-    if iter_num % eval_interval == 0:
+    # evaluation
+    if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(
             f"iter {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
@@ -138,7 +309,7 @@ while iter_num <= max_iters:
             best_val_loss = losses["val"]
             os.makedirs(out_dir, exist_ok=True)
             checkpoint = {
-                "model": model.state_dict(),
+                "model": raw_model.state_dict(),
                 "config": model_config.__dict__,
                 "iter_num": iter_num,
                 "best_val_loss": best_val_loss,
@@ -147,21 +318,56 @@ while iter_num <= max_iters:
 
     t0 = time.time()
 
+    # training step with gradient accumulation
     optimizer.zero_grad(set_to_none=True)
+
     for micro_step in range(gradient_accumulation_steps):
+        if ddp:
+            # only sync gradients on the last micro step
+            model.require_backward_grad_sync = (
+                micro_step == gradient_accumulation_steps - 1
+            )
+
         x, y = get_batch("train")
-        _, loss = model(x, y)
-        loss = loss / gradient_accumulation_steps
-        loss.backward()
 
-    optimizer.step()
+        with ctx:
+            _, loss = model(x, y)
+            loss = loss / gradient_accumulation_steps
 
-    loss_item = loss.item() if loss is not None else float("nan")
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+    # gradient clipping
+    if grad_clip != 0.0:
+        if scaler is not None:
+            scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+    # optimizer step
+    if scaler is not None:
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        optimizer.step()
+
     dt = time.time() - t0
+    tokens_per_sec = (
+        batch_size * block_size * gradient_accumulation_steps * ddp_world_size / dt
+    )
 
-    if iter_num % log_interval == 0:
+    if iter_num % log_interval == 0 and master_process:
+        loss_item = loss.item() * gradient_accumulation_steps
         print(
-            f"iter {iter_num}: loss {loss_item:.4f}, lr {lr:.5f}, time {dt * 1000:.2f}ms"
+            f"iter {iter_num}: loss {loss_item:.4f}, lr {lr:.2e}, "
+            f"time {dt * 1000:.0f}ms, tok/s {tokens_per_sec:.0f}"
         )
 
     iter_num += 1
+
+# -----------------------------------------------------------------------------
+# Cleanup
+
+if ddp:
+    dist.destroy_process_group()
