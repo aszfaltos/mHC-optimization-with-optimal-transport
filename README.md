@@ -55,4 +55,4 @@ Built using code snippets from `nanogpt`, `lucidrains/hyper-connections` and my 
 
 ### License
 
-MIT
+Apache 2.0
