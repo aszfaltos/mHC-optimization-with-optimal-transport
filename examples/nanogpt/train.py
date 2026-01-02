@@ -30,8 +30,10 @@ from contextlib import nullcontext
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from hyper_connections import HyperConnections
 from model import GPT, GPTConfig
 
 # -----------------------------------------------------------------------------
@@ -84,6 +86,8 @@ compile_model = False
 wandb_log = True
 wandb_project = "mhc-nanogpt"
 wandb_run_name = "baseline"
+wandb_log_layer_stats = True
+wandb_log_layer_cosine = True
 
 # DDP backend: "nccl", "gloo", etc.
 # If NCCL fails, set NCCL_IB_DISABLE=1 or use backend="gloo"
@@ -256,6 +260,12 @@ if ddp:
 
 raw_model = model.module if ddp else model
 
+if wandb_log and wandb_log_layer_stats:
+    for block in raw_model.transformer.h:
+        for hc in (block.hc_attn, block.hc_mlp):
+            if isinstance(hc, HyperConnections):
+                hc.collect_stats = True
+
 optimizer = raw_model.configure_optimizers(
     weight_decay=weight_decay,
     learning_rate=learning_rate,
@@ -279,6 +289,65 @@ def get_lr(it):
     return min_lr + coeff * (learning_rate - min_lr)
 
 
+def collect_hc_layer_stats():
+    layer_count = len(raw_model.transformer.h) * 2
+    layer_stats = {}
+    for block_idx, block in enumerate(raw_model.transformer.h):
+        for sub_idx, hc in enumerate((block.hc_attn, block.hc_mlp)):
+            if not hasattr(hc, "last_stats"):
+                continue
+            layer_index = block_idx * 2 + sub_idx
+            for key, value in hc.last_stats.items():
+                layer_stats.setdefault(key, [None] * layer_count)
+                layer_stats[key][layer_index] = value.item()
+    return layer_stats
+
+
+def build_layer_table(layer_stats):
+    if not layer_stats:
+        return None
+    keys = sorted(layer_stats.keys())
+    layer_count = max(len(v) for v in layer_stats.values())
+    table = wandb.Table(columns=["layer"] + keys)
+    for i in range(layer_count):
+        row_vals = []
+        for key in keys:
+            values = layer_stats[key]
+            val = values[i] if i < len(values) else None
+            row_vals.append(val)
+        if all(v is None for v in row_vals):
+            continue
+        table.add_data(i, *row_vals)
+    return table
+
+
+def forward_with_layer_cosine(x, y):
+    sims = []
+    prev = [None]
+    handles = []
+
+    def hook(_, __, output):
+        out = output.detach()
+        if prev[0] is not None:
+            prev_flat = prev[0].reshape(-1, prev[0].shape[-1])
+            out_flat = out.reshape(-1, out.shape[-1])
+            sim = F.cosine_similarity(prev_flat, out_flat, dim=-1).mean()
+            sims.append(sim)
+        prev[0] = out
+
+    for block in raw_model.transformer.h:
+        handles.append(block.register_forward_hook(hook))
+
+    with ctx:
+        _, loss = model(x, y)
+
+    for handle in handles:
+        handle.remove()
+
+    sims = [s.item() for s in sims]
+    return loss, sims
+
+
 # -----------------------------------------------------------------------------
 # Evaluation
 
@@ -286,17 +355,27 @@ def get_lr(it):
 @torch.no_grad()
 def estimate_loss():
     out = {}
+    layer_cosine = None
     model.eval()
     for split in ["train", "val"]:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             x, y = get_batch(split)
-            with ctx:
-                _, loss = model(x, y)
+            if (
+                layer_cosine is None
+                and wandb_log
+                and wandb_log_layer_cosine
+                and split == "train"
+                and k == 0
+            ):
+                loss, layer_cosine = forward_with_layer_cosine(x, y)
+            else:
+                with ctx:
+                    _, loss = model(x, y)
             losses[k] = loss.item()
         out[split] = losses.mean().item()
     model.train()
-    return out
+    return out, layer_cosine
 
 
 # -----------------------------------------------------------------------------
@@ -336,8 +415,12 @@ if wandb_log and master_process:
             "dtype": dtype,
             "world_size": ddp_world_size,
             "tokens_per_iter": tokens_per_iter,
+            "wandb_log_layer_stats": wandb_log_layer_stats,
+            "wandb_log_layer_cosine": wandb_log_layer_cosine,
         },
     )
+
+start_time = time.time()
 
 while iter_num <= max_iters:
     lr = get_lr(iter_num)
@@ -346,15 +429,28 @@ while iter_num <= max_iters:
 
     # evaluation
     if iter_num % eval_interval == 0 and master_process:
-        losses = estimate_loss()
+        losses, layer_cosine = estimate_loss()
         print(
             f"iter {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
         )
         if wandb_log:
-            wandb.log(
-                {"val/loss": losses["val"], "train/loss_eval": losses["train"]},
-                step=iter_num,
-            )
+            eval_log = {
+                "val/loss": losses["val"],
+                "train/loss_eval": losses["train"],
+                "perf/elapsed_s": time.time() - start_time,
+                "tokens/seen": iter_num * tokens_per_iter,
+            }
+            wandb.log(eval_log, step=iter_num)
+            if wandb_log_layer_cosine and layer_cosine is not None:
+                layer_table = wandb.Table(columns=["layer", "cosine"])
+                for idx, value in enumerate(layer_cosine):
+                    layer_table.add_data(idx, value)
+                wandb.log({"hc/layer_cosine": layer_table}, step=iter_num)
+            if wandb_log_layer_stats:
+                layer_stats = collect_hc_layer_stats()
+                layer_stats_table = build_layer_table(layer_stats)
+                if layer_stats_table is not None:
+                    wandb.log({"hc/layer_stats": layer_stats_table}, step=iter_num)
         if losses["val"] < best_val_loss:
             best_val_loss = losses["val"]
             os.makedirs(out_dir, exist_ok=True)
@@ -390,10 +486,11 @@ while iter_num <= max_iters:
             loss.backward()
 
     # gradient clipping
+    grad_norm = None
     if grad_clip != 0.0:
         if scaler is not None:
             scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(raw_model.parameters(), grad_clip)
+        grad_norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), grad_clip)
 
     # optimizer step
     if scaler is not None:
@@ -412,15 +509,26 @@ while iter_num <= max_iters:
             f"time {dt * 1000:.0f}ms, tok/s {tokens_per_sec:.0f}"
         )
         if wandb_log:
-            wandb.log(
-                {
-                    "train/loss": loss_item,
-                    "train/lr": lr,
-                    "perf/tok_per_sec": tokens_per_sec,
-                    "perf/iter_time_ms": dt * 1000,
-                },
-                step=iter_num,
-            )
+            log_dict = {
+                "train/loss": loss_item,
+                "train/lr": lr,
+                "perf/tok_per_sec": tokens_per_sec,
+                "perf/iter_time_ms": dt * 1000,
+                "perf/elapsed_s": time.time() - start_time,
+                "tokens/seen": iter_num * tokens_per_iter,
+            }
+            if grad_norm is not None:
+                log_dict["train/grad_norm"] = grad_norm.item()
+            if device_type == "cuda":
+                log_dict["perf/max_mem_allocated_mb"] = (
+                    torch.cuda.max_memory_allocated() / 1e6
+                )
+                log_dict["perf/max_mem_reserved_mb"] = (
+                    torch.cuda.max_memory_reserved() / 1e6
+                )
+            wandb.log(log_dict, step=iter_num)
+            if device_type == "cuda":
+                torch.cuda.reset_peak_memory_stats()
 
     iter_num += 1
 
