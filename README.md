@@ -46,7 +46,7 @@ Run from `examples/nanogpt/`. Adjust `--nproc_per_node` to match your GPU count.
 ### Next steps planned
 - [x] Value residual ablations with baseline/HC/mHC
 - [ ] AltUP ablation
-- [ ] H^res = `(1−α)*I + α*S` instead of full doubly stochastic
+- [x] H^res = `(1−α)*I + α*S` instead of full doubly stochastic (branch: `feat/mhc-residual-identity-mix`)
 - [ ] Replace sinkhorn-knopp w/ Muon's orthogonalization op
 - [ ] U-net-based variants + value embeddings
 
