@@ -20,9 +20,9 @@ dropout = 0.0
 bias = False
 
 # training
-batch_size = 8
+batch_size = 16
 gradient_accumulation_steps = 4
-max_iters = 5000
+max_iters = 10000
 eval_interval = 500
 log_interval = 10
 eval_iters = 100
@@ -36,7 +36,7 @@ grad_clip = 1.0
 
 # lr schedule
 warmup_iters = 200
-lr_decay_iters = 5000
+lr_decay_iters = 10000
 min_lr = 6e-5
 
 # dtype
