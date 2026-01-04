@@ -110,7 +110,8 @@ def get_wandb_variant():
 
 wandb_variant = get_wandb_variant()
 wandb_group = f"{dataset}-L{n_layer}-D{n_embd}-H{n_head}"
-wandb_run_name = f"{dataset}-{wandb_variant}-L{n_layer}-D{n_embd}-H{n_head}-s{seed}"
+if wandb_run_name == "baseline":
+    wandb_run_name = f"{dataset}-{wandb_variant}-L{n_layer}-D{n_embd}-H{n_head}-s{seed}"
 wandb_job_type = wandb_variant
 wandb_tags = [
     dataset,
