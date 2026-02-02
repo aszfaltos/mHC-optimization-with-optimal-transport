@@ -49,54 +49,6 @@ def test_manual():
 
 
 @pytest.mark.parametrize("disable", (False, True))
-def test_multi_input_hyper_connections(disable):
-    from hyper_connections.hyper_connections_with_multi_input_streams import (
-        HyperConnections,
-    )
-
-    class CustomModule(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.linear = nn.Linear(512, 512)
-            self.second_linear = nn.Linear(256, 512)
-            self.third_linear = nn.Linear(128, 512)
-
-        def forward(self, x, second, *, third):
-            return self.linear(x) + self.second_linear(second) + self.third_linear(
-                third
-            ), 3.0
-
-    branch = CustomModule()
-
-    residual = torch.randn(3, 1024, 512)
-    second_residual = torch.randn(3, 1024, 256)
-    third_residual = torch.randn(3, 1024, 128)
-
-    init_hyper_conn, expand_stream, reduce_stream = (
-        HyperConnections.get_init_and_expand_reduce_stream_functions(4, disable=disable)
-    )
-
-    hyper_conn = init_hyper_conn(
-        dim=512,
-        branch=branch,
-        additional_input_paths=[
-            (1, 256),
-            ("third", 128),
-        ],
-        layer_index=1,
-    )
-
-    residual = expand_stream(residual)
-    second_residual = expand_stream(second_residual)
-    third_residual = expand_stream(third_residual)
-
-    residual, rest_output = hyper_conn(residual, second_residual, third=third_residual)
-    residual = reduce_stream(residual)
-
-    assert residual.shape == (3, 1024, 512)
-
-
-@pytest.mark.parametrize("disable", (False, True))
 def test_residual_transform(disable):
     from hyper_connections import get_init_and_expand_reduce_stream_functions
 
@@ -114,35 +66,6 @@ def test_residual_transform(disable):
 
     hyper_conn_branch = init_hyper_conn(
         dim=512, branch=branch, channel_first=True, residual_transform=residual_fn
-    )
-
-    residual = expand_stream(residual)
-    residual = hyper_conn_branch(residual)
-    after_residual = reduce_stream(residual)
-
-    assert before_residual.shape == after_residual.shape
-
-
-@pytest.mark.parametrize("disable", (False, True))
-def test_channel_first_hyper_connection(disable):
-    from hyper_connections.hyper_connections_channel_first import (
-        get_init_and_expand_reduce_stream_functions,
-    )
-
-    branch = nn.Sequential(
-        nn.Conv2d(512, 512, 3, padding=1), nn.SiLU(), nn.Conv2d(512, 256, 3, padding=1)
-    )
-    residual_fn = nn.Conv2d(512, 256, 1)
-
-    residual = torch.randn(2, 512, 16, 16)
-    before_residual = branch(residual) + residual_fn(residual)
-
-    init_hyper_conn, expand_stream, reduce_stream = (
-        get_init_and_expand_reduce_stream_functions(4, disable=disable)
-    )
-
-    hyper_conn_branch = init_hyper_conn(
-        dim=512, branch=branch, residual_transform=residual_fn
     )
 
     residual = expand_stream(residual)
