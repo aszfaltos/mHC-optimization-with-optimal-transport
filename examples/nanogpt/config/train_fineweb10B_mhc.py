@@ -47,7 +47,6 @@ hc_disable = False
 mhc = True
 sinkhorn_iters = 10
 sinkhorn_tau = 0.05
-mhc_h_res_proj = "sinkhorn"
-ns_steps = 5
-ns_eps = 1e-7
-ns_coeffs = (3.0, -3.2, 1.2)
+
+mhc_residual_identity_mix = False
+mhc_residual_alpha = 0.01

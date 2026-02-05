@@ -64,34 +64,6 @@ def sinkhorn_log(logits, num_iters=10, tau=0.05):
     return torch.exp(Z + u.unsqueeze(1) + v.unsqueeze(0)) * n
 
 
-def zeropower_via_newtonschulz(X, steps=5, eps=1e-7, coeffs=(3.0, -3.2, 1.2)):
-    a, b, c = coeffs
-
-    X = X / (X.norm() + eps)
-
-    transpose = False
-    if X.shape[0] > X.shape[1]:
-        X = X.T
-        transpose = True
-
-    for _ in range(steps):
-        A = X @ X.T
-        B = b * A + c * A @ A
-        X = a * X + B @ X
-
-    if transpose:
-        X = X.T
-
-    return X
-
-
-def orthostochastic_project(
-    logits, ns_steps=5, ns_eps=1e-7, ns_coeffs=(3.0, -3.2, 1.2)
-):
-    O = zeropower_via_newtonschulz(logits, steps=ns_steps, eps=ns_eps, coeffs=ns_coeffs)
-    return O.square()
-
-
 # main functions
 
 
@@ -157,8 +129,8 @@ class Residual(Module):
     def __init__(
         self,
         *args,
-        branch: Module | None = None,
-        residual_transform: Module | None = None,
+        branch=None,
+        residual_transform=None,
         **kwargs,
     ):
         super().__init__()
@@ -216,13 +188,12 @@ class HyperConnections(Module):
         num_residual_streams,
         *,
         dim,
-        branch: Module | None = None,
+        branch=None,
         layer_index=None,
         tanh=True,
         channel_first=False,
         dropout=0.0,
-        residual_transform: Module
-        | None = None,  # to support resnet blocks where dimension in not equal to dimension out - usually a residual conv
+        residual_transform=None,  # to support resnet blocks where dimension in not equal to dimension out - usually a residual conv
         add_branch_out_to_residual=True,  # will disable depth connections (weighted residual sum with beta) if set False
         num_input_views=1,  # allow for the branch module to receive multiple input views, dimension placed on the very left (before batch)
         depth_residual_fn=add,
@@ -230,10 +201,8 @@ class HyperConnections(Module):
         mhc=False,
         sinkhorn_iters=10,
         sinkhorn_tau=0.05,
-        mhc_h_res_proj="sinkhorn",
-        ns_steps=5,
-        ns_eps=1e-7,
-        ns_coeffs=(3.0, -3.2, 1.2),
+        mhc_residual_identity_mix=False,
+        mhc_residual_alpha=0.01,
     ):
         """
         Appendix J, Algorithm2 in - https://arxiv.org/abs/2409.19606
@@ -330,18 +299,11 @@ class HyperConnections(Module):
         self.mhc = mhc
         self.sinkhorn_iters = sinkhorn_iters
         self.sinkhorn_tau = sinkhorn_tau
-        self.mhc_h_res_proj = mhc_h_res_proj
-        self.ns_steps = ns_steps
-        self.ns_eps = ns_eps
-        self.ns_coeffs = ns_coeffs
+        self.mhc_residual_identity_mix = mhc_residual_identity_mix
 
         if mhc:
             assert num_fracs == 1, "mhc currently requires num_fracs = 1"
             assert num_input_views == 1, "mhc currently requires num_input_views = 1"
-            assert mhc_h_res_proj in (
-                "sinkhorn",
-                "orthostochastic",
-            ), "mhc_h_res_proj must be 'sinkhorn' or 'orthostochastic'"
 
             H_res_init = torch.full((num_residual_streams, num_residual_streams), -8.0)
             H_res_init.fill_diagonal_(0.0)
@@ -354,10 +316,17 @@ class HyperConnections(Module):
             if add_branch_out_to_residual:
                 self.H_post_logits = nn.Parameter(torch.zeros(num_residual_streams))
 
+            if mhc_residual_identity_mix:
+                alpha_clamped = max(1e-4, min(1 - 1e-4, mhc_residual_alpha))
+                alpha_logit_init = math.log(alpha_clamped / (1 - alpha_clamped))
+                self.H_res_alpha_logit = nn.Parameter(torch.tensor(alpha_logit_init))
+
     def width_connection(self, residuals):
         streams = self.num_residual_streams
 
-        maybe_transformed_residuals = self.residual_transform(residuals)
+        residuals_mixed_source = None
+        if self.mhc:
+            residuals_mixed_source = self.residual_transform(residuals)
 
         # width connection
 
@@ -375,8 +344,6 @@ class HyperConnections(Module):
         residuals = rearrange(residuals, "(b s) ... d -> b ... s d", s=streams)
 
         if self.mhc:
-            residuals_mixed_source = maybe_transformed_residuals
-
             if self.channel_first:
                 residuals_mixed_source = rearrange(
                     residuals_mixed_source, "b d ... -> b ... d"
@@ -387,17 +354,15 @@ class HyperConnections(Module):
                 residuals_mixed_source, "(b s) ... d -> b ... s d", s=streams
             )
 
-            if self.mhc_h_res_proj == "orthostochastic":
-                H_res = orthostochastic_project(
-                    self.H_res_logits,
-                    ns_steps=self.ns_steps,
-                    ns_eps=self.ns_eps,
-                    ns_coeffs=self.ns_coeffs,
-                )
+            S = sinkhorn_log(self.H_res_logits, self.sinkhorn_iters, self.sinkhorn_tau)
+
+            if self.mhc_residual_identity_mix:
+                alpha = torch.sigmoid(self.H_res_alpha_logit)
+                I = torch.eye(streams, device=S.device, dtype=S.dtype)
+                H_res = (1 - alpha) * I + alpha * S
             else:
-                H_res = sinkhorn_log(
-                    self.H_res_logits, self.sinkhorn_iters, self.sinkhorn_tau
-                )
+                H_res = S
+
             H_pre = F.softmax(self.H_pre_logits, dim=-1)
 
             H_post = None
@@ -419,6 +384,8 @@ class HyperConnections(Module):
                     )
                     if H_post is not None:
                         stats["h_post_min"] = H_post.min()
+                    if self.mhc_residual_identity_mix:
+                        stats["h_res_alpha"] = torch.sigmoid(self.H_res_alpha_logit)
                     self.last_stats = {k: v.detach() for k, v in stats.items()}
 
             if self.channel_first:
@@ -426,9 +393,15 @@ class HyperConnections(Module):
 
             branch_input = self.merge_fracs(branch_input)
 
+            residuals_out = rearrange(residuals_mixed, "b ... s d -> (b s) ... d")
+            residuals_out = self.merge_fracs(residuals_out)
+
+            if self.channel_first:
+                residuals_out = rearrange(residuals_out, "b ... d -> b d ...")
+
             return (
                 branch_input,
-                maybe_transformed_residuals,
+                residuals_out,
                 dict(beta=H_post, residuals_mixed=residuals_mixed),
             )
 
@@ -507,7 +480,15 @@ class HyperConnections(Module):
 
         branch_input = self.merge_fracs(branch_input)
 
-        return branch_input, maybe_transformed_residuals, dict(beta=beta)
+        residuals = rearrange(residuals, "b ... s d -> (b s) ... d")
+        residuals = self.merge_fracs(residuals)
+
+        if self.channel_first:
+            residuals = rearrange(residuals, "b ... d -> b d ...")
+
+        residuals = self.residual_transform(residuals)
+
+        return branch_input, residuals, dict(beta=beta)
 
     def depth_connection(self, branch_output, residuals, *, beta, residuals_mixed=None):
         assert self.add_branch_out_to_residual

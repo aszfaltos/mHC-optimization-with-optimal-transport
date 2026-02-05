@@ -49,6 +49,54 @@ def test_manual():
 
 
 @pytest.mark.parametrize("disable", (False, True))
+def test_multi_input_hyper_connections(disable):
+    from hyper_connections.hyper_connections_with_multi_input_streams import (
+        HyperConnections,
+    )
+
+    class CustomModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(512, 512)
+            self.second_linear = nn.Linear(256, 512)
+            self.third_linear = nn.Linear(128, 512)
+
+        def forward(self, x, second, *, third):
+            return self.linear(x) + self.second_linear(second) + self.third_linear(
+                third
+            ), 3.0
+
+    branch = CustomModule()
+
+    residual = torch.randn(3, 1024, 512)
+    second_residual = torch.randn(3, 1024, 256)
+    third_residual = torch.randn(3, 1024, 128)
+
+    init_hyper_conn, expand_stream, reduce_stream = (
+        HyperConnections.get_init_and_expand_reduce_stream_functions(4, disable=disable)
+    )
+
+    hyper_conn = init_hyper_conn(
+        dim=512,
+        branch=branch,
+        additional_input_paths=[
+            (1, 256),
+            ("third", 128),
+        ],
+        layer_index=1,
+    )
+
+    residual = expand_stream(residual)
+    second_residual = expand_stream(second_residual)
+    third_residual = expand_stream(third_residual)
+
+    residual, rest_output = hyper_conn(residual, second_residual, third=third_residual)
+    residual = reduce_stream(residual)
+
+    assert residual.shape == (3, 1024, 512)
+
+
+@pytest.mark.parametrize("disable", (False, True))
 def test_residual_transform(disable):
     from hyper_connections import get_init_and_expand_reduce_stream_functions
 
@@ -66,6 +114,35 @@ def test_residual_transform(disable):
 
     hyper_conn_branch = init_hyper_conn(
         dim=512, branch=branch, channel_first=True, residual_transform=residual_fn
+    )
+
+    residual = expand_stream(residual)
+    residual = hyper_conn_branch(residual)
+    after_residual = reduce_stream(residual)
+
+    assert before_residual.shape == after_residual.shape
+
+
+@pytest.mark.parametrize("disable", (False, True))
+def test_channel_first_hyper_connection(disable):
+    from hyper_connections.hyper_connections_channel_first import (
+        get_init_and_expand_reduce_stream_functions,
+    )
+
+    branch = nn.Sequential(
+        nn.Conv2d(512, 512, 3, padding=1), nn.SiLU(), nn.Conv2d(512, 256, 3, padding=1)
+    )
+    residual_fn = nn.Conv2d(512, 256, 1)
+
+    residual = torch.randn(2, 512, 16, 16)
+    before_residual = branch(residual) + residual_fn(residual)
+
+    init_hyper_conn, expand_stream, reduce_stream = (
+        get_init_and_expand_reduce_stream_functions(4, disable=disable)
+    )
+
+    hyper_conn_branch = init_hyper_conn(
+        dim=512, branch=branch, residual_transform=residual_fn
     )
 
     residual = expand_stream(residual)
@@ -158,40 +235,6 @@ def test_mhc_H_res_constraints():
     )
 
 
-def test_mhc_orthostochastic_constraints():
-    from hyper_connections.hyper_connections import (
-        HyperConnections,
-        orthostochastic_project,
-        zeropower_via_newtonschulz,
-    )
-
-    hc = HyperConnections(
-        num_residual_streams=4,
-        dim=64,
-        mhc=True,
-        mhc_h_res_proj="orthostochastic",
-    )
-    O = zeropower_via_newtonschulz(
-        hc.H_res_logits,
-        steps=hc.ns_steps,
-        eps=hc.ns_eps,
-        coeffs=hc.ns_coeffs,
-    )
-    H_res = orthostochastic_project(
-        hc.H_res_logits,
-        ns_steps=hc.ns_steps,
-        ns_eps=hc.ns_eps,
-        ns_coeffs=hc.ns_coeffs,
-    )
-
-    assert H_res.min().item() >= 0
-    assert torch.allclose(
-        O @ O.T,
-        torch.eye(4, device=O.device, dtype=O.dtype),
-        atol=1e-2,
-    )
-
-
 def test_mhc_H_pre_H_post_constraints():
     from hyper_connections.hyper_connections import HyperConnections
 
@@ -244,3 +287,126 @@ def test_mhc_gradients_flow():
     assert not torch.isnan(hc.H_res_logits.grad).any()
     assert not torch.isnan(hc.H_pre_logits.grad).any()
     assert not torch.isnan(hc.H_post_logits.grad).any()
+
+
+def test_mhc_identity_mix_H_res_constraints():
+    from hyper_connections.hyper_connections import HyperConnections, sinkhorn_log
+
+    hc = HyperConnections(
+        num_residual_streams=4, dim=64, mhc=True, mhc_residual_identity_mix=True
+    )
+    S = sinkhorn_log(hc.H_res_logits, hc.sinkhorn_iters, hc.sinkhorn_tau)
+    alpha = torch.sigmoid(hc.H_res_alpha_logit)
+    I = torch.eye(4, device=S.device, dtype=S.dtype)
+    H_res = (1 - alpha) * I + alpha * S
+
+    assert H_res.min().item() >= 0
+    assert torch.allclose(
+        H_res.sum(dim=-1),
+        torch.ones(4, device=H_res.device, dtype=H_res.dtype),
+        atol=1e-3,
+    )
+    assert torch.allclose(
+        H_res.sum(dim=-2),
+        torch.ones(4, device=H_res.device, dtype=H_res.dtype),
+        atol=1e-3,
+    )
+
+
+def test_mhc_identity_mix_alpha_init():
+    from hyper_connections.hyper_connections import HyperConnections
+
+    hc = HyperConnections(
+        num_residual_streams=4,
+        dim=64,
+        mhc=True,
+        mhc_residual_identity_mix=True,
+        mhc_residual_alpha=0.01,
+    )
+    alpha = torch.sigmoid(hc.H_res_alpha_logit)
+    assert torch.allclose(alpha, torch.tensor(0.01), atol=1e-3)
+
+
+def test_mhc_identity_mix_gradients_flow():
+    from hyper_connections.hyper_connections import HyperConnections
+
+    hc = HyperConnections(
+        num_residual_streams=4, dim=64, mhc=True, mhc_residual_identity_mix=True
+    )
+    x = torch.randn(8, 8, 64, requires_grad=True)
+
+    branch_input, add_residual = hc(x)
+    out = add_residual(branch_input)
+    out.sum().backward()
+
+    assert hc.H_res_logits.grad is not None
+    assert hc.H_pre_logits.grad is not None
+    assert hc.H_post_logits.grad is not None
+    assert hc.H_res_alpha_logit.grad is not None
+    assert not torch.isnan(hc.H_res_alpha_logit.grad).any()
+
+
+def test_mhc_identity_mix_forward_shapes():
+    from hyper_connections.hyper_connections import HyperConnections
+
+    streams, dim, batch, seq = 4, 64, 2, 8
+    hc = HyperConnections(
+        num_residual_streams=streams,
+        dim=dim,
+        mhc=True,
+        mhc_residual_identity_mix=True,
+    )
+    x = torch.randn(batch * streams, seq, dim)
+
+    branch_input, add_residual = hc(x)
+    assert branch_input.shape == (batch, seq, dim)
+
+    branch_output = torch.randn(batch, seq, dim)
+    out = add_residual(branch_output)
+    assert out.shape == (batch * streams, seq, dim)
+
+
+def test_hc_width_connection_applies_residual_mixing():
+    from hyper_connections.hyper_connections import HyperConnections
+
+    torch.manual_seed(0)
+
+    streams, dim, batch, seq = 2, 4, 1, 3
+    hc = HyperConnections(num_residual_streams=streams, dim=dim)
+
+    x0 = torch.zeros(batch, seq, dim)
+    x1 = torch.ones(batch, seq, dim)
+    x = torch.cat((x0, x1), dim=0)
+
+    with torch.no_grad():
+        hc.static_alpha.zero_()
+        hc.static_alpha[1, 1] = 1.0  # residual stream 0 output <- stream 1
+        hc.static_alpha[0, 2] = 1.0  # residual stream 1 output <- stream 0
+
+    branch_input, residuals, _ = hc.width_connection(x)
+
+    torch.testing.assert_close(branch_input, torch.zeros(batch, seq, dim))
+    torch.testing.assert_close(residuals, torch.cat((x1, x0), dim=0))
+
+
+def test_hc_channel_first_width_connection_applies_residual_mixing():
+    from hyper_connections.hyper_connections_channel_first import HyperConnections
+
+    torch.manual_seed(0)
+
+    streams, dim, batch, h, w = 2, 4, 1, 2, 2
+    hc = HyperConnections(num_residual_streams=streams, dim=dim)
+
+    x0 = torch.zeros(batch, dim, h, w)
+    x1 = torch.ones(batch, dim, h, w)
+    x = torch.cat((x0, x1), dim=0)
+
+    with torch.no_grad():
+        hc.static_alpha.zero_()
+        hc.static_alpha[1, 1] = 1.0  # residual stream 0 output <- stream 1
+        hc.static_alpha[0, 2] = 1.0  # residual stream 1 output <- stream 0
+
+    branch_input, residuals, _ = hc.width_connection(x)
+
+    torch.testing.assert_close(branch_input, torch.zeros(batch, dim, h, w))
+    torch.testing.assert_close(residuals, torch.cat((x1, x0), dim=0))

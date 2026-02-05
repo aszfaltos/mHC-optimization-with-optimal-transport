@@ -128,10 +128,8 @@ class Block(nn.Module):
             mhc=config.mhc,
             sinkhorn_iters=config.sinkhorn_iters,
             sinkhorn_tau=config.sinkhorn_tau,
-            mhc_h_res_proj=config.mhc_h_res_proj,
-            ns_steps=config.ns_steps,
-            ns_eps=config.ns_eps,
-            ns_coeffs=config.ns_coeffs,
+            mhc_residual_identity_mix=config.mhc_residual_identity_mix,
+            mhc_residual_alpha=config.mhc_residual_alpha,
         )
 
         self.hc_attn = init_hc(
@@ -170,10 +168,8 @@ class GPTConfig:
         self.mhc = kwargs.pop("mhc", False)
         self.sinkhorn_iters = kwargs.pop("sinkhorn_iters", 10)
         self.sinkhorn_tau = kwargs.pop("sinkhorn_tau", 0.05)
-        self.mhc_h_res_proj = kwargs.pop("mhc_h_res_proj", "sinkhorn")
-        self.ns_steps = kwargs.pop("ns_steps", 5)
-        self.ns_eps = kwargs.pop("ns_eps", 1e-7)
-        self.ns_coeffs = kwargs.pop("ns_coeffs", (3.0, -3.2, 1.2))
+        self.mhc_residual_identity_mix = kwargs.pop("mhc_residual_identity_mix", False)
+        self.mhc_residual_alpha = kwargs.pop("mhc_residual_alpha", 0.01)
         self.v_residual = kwargs.pop("v_residual", False)
         self.v_residual_lamb_lr = kwargs.pop("v_residual_lamb_lr", 1e-2)
 

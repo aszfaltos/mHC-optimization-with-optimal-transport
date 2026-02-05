@@ -2,6 +2,7 @@ from typing import Callable
 
 from functools import partial
 from random import randrange
+import math
 
 import torch
 from torch import nn
@@ -113,18 +114,19 @@ class HyperConnections(Module):
         num_residual_streams,
         *,
         dim,
-        branch: Module | None = None,
+        branch=None,
         layer_index=None,
         channel_first=False,
         dropout=0.0,
-        residual_transform: Module
-        | None = None,  # to support resnet blocks where dimension in not equal to dimension out - usually a residual conv
+        residual_transform=None,  # to support resnet blocks where dimension in not equal to dimension out - usually a residual conv
         add_branch_out_to_residual=True,  # will disable depth connections (weighted residual sum with beta) if set False
         num_input_views=1,  # allow for the branch module to receive multiple input views, dimension placed on the very left (before batch)
         depth_residual_fn=add,
         num_fracs=1,  # https://arxiv.org/abs/2503.14125
         mhc_num_iters=10,
         mhc_tau=0.05,
+        mhc_residual_identity_mix=False,
+        mhc_residual_alpha=0.01,
     ):
         """
         Appendix J, Algorithm2 in - https://arxiv.org/abs/2409.19606
@@ -134,6 +136,7 @@ class HyperConnections(Module):
         self.branch = branch
         self.mhc_num_iters = mhc_num_iters
         self.mhc_tau = mhc_tau
+        self.mhc_residual_identity_mix = mhc_residual_identity_mix
 
         # frac-connections paper - num_fracs > 1 will be the `m` in their paper https://arxiv.org/abs/2503.14125
 
@@ -182,6 +185,11 @@ class HyperConnections(Module):
                 torch.zeros(num_input_views, num_residual_streams)
             )
 
+        if mhc_residual_identity_mix:
+            alpha_clamped = max(1e-4, min(1 - 1e-4, mhc_residual_alpha))
+            alpha_logit_init = math.log(alpha_clamped / (1 - alpha_clamped))
+            self.H_res_alpha_logit = nn.Parameter(torch.tensor(alpha_logit_init))
+
         # dropouts
 
         self.dropout = nn.Dropout(dropout)
@@ -221,9 +229,17 @@ class HyperConnections(Module):
             maybe_transformed_residuals, "(b s) ... d -> b ... s d", s=streams
         )
 
-        h_res = sinkhorn_log(
+        S = sinkhorn_log(
             self.H_res_logits, num_iters=self.mhc_num_iters, tau=self.mhc_tau
         )
+
+        if self.mhc_residual_identity_mix:
+            alpha = torch.sigmoid(self.H_res_alpha_logit)
+            I = torch.eye(streams, device=S.device, dtype=S.dtype)
+            h_res = (1 - alpha) * I + alpha * S
+        else:
+            h_res = S
+
         residuals_out = einsum(
             h_res, maybe_transformed_residuals, "s t, ... s d -> ... t d"
         )
@@ -245,6 +261,8 @@ class HyperConnections(Module):
                 )
                 if h_post is not None:
                     stats["h_post_min"] = h_post.min()
+                if self.mhc_residual_identity_mix:
+                    stats["h_res_alpha"] = torch.sigmoid(self.H_res_alpha_logit)
                 self.last_stats = {k: v.detach() for k, v in stats.items()}
 
         if self.num_input_views == 1:

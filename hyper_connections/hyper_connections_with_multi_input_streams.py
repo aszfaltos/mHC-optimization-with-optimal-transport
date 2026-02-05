@@ -95,7 +95,7 @@ class Residual(Module):
     def __init__(
         self,
         *args,
-        branch: Module | None = None,
+        branch=None,
         **kwargs
     ):
         super().__init__()
@@ -149,12 +149,8 @@ class HyperConnections(Module):
         num_residual_streams,
         *,
         dim,
-        additional_input_paths: (
-            list[InputPathType |
-            tuple[InputPathType, int]] # if the second residual has different dimensions, second tuple element is the dimension
-            | None
-        ) = None,
-        branch: Module | None = None,
+        additional_input_paths = None, # if an additional residual has different dimensions, pass (path, dim)
+        branch=None,
         layer_index = None,
         tanh = True,
         channel_first = False,
