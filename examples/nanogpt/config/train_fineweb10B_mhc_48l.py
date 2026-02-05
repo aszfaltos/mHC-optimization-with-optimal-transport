@@ -1,24 +1,25 @@
-# FineWeb10B with mHC (4 streams)
+# FineWeb10B with mHC (4 streams, 48 layers)
 # ~20M param GPT-2 style model
 #
 # Usage:
-#   python train.py config/train_fineweb10B_mhc.py
-#   torchrun --standalone --nproc_per_node=4 train.py config/train_fineweb10B_mhc.py
+#   python train.py config/train_fineweb10B_mhc_48l.py
+#   torchrun --standalone --nproc_per_node=4 train.py config/train_fineweb10B_mhc_48l.py
 
-out_dir = "out-fineweb10B-mhc"
-wandb_run_name = "mhc"
+out_dir = "out-fineweb10B-mhc-48l"
+wandb_run_name = "mhc-48l"
+wandb_project = "mhc-nanogpt-48"
 
 dataset = "fineweb10B"
 
 # model
 block_size = 1024
-n_layer = 6
+n_layer = 48
 n_head = 6
-n_embd = 288
+n_embd = 150
 dropout = 0.0
 bias = False
 
-batch_size = 32
+batch_size = 8
 gradient_accumulation_steps = 4
 max_iters = 5000
 eval_interval = 500
@@ -51,6 +52,3 @@ mhc_h_res_proj = "sinkhorn"
 ns_steps = 5
 ns_eps = 1e-7
 ns_coeffs = (3.0, -3.2, 1.2)
-
-mhc_residual_identity_mix = False
-mhc_residual_alpha = 0.01
