@@ -71,7 +71,7 @@ class HyperConnections(Module):
         num_residual_streams,
         *,
         dim,
-        branch: Module | tuple[Module, ...] | list[Module] | None = None,
+        branch=None,
         layer_index = None,
         tanh = True,
         channel_first = False,
@@ -184,7 +184,7 @@ class HyperConnections(Module):
 
         return self.dropout(output)
 
-    def decorate_branch(self, branch: Callable | tuple[Callable, ...] | list[Callable]):
+    def decorate_branch(self, branch):
         assert not exists(self.branches), 'branch was already wrapped on init'
 
         def forward_and_add_residual(residual, *args, **kwargs):

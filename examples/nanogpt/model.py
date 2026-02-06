@@ -132,6 +132,8 @@ class Block(nn.Module):
             ns_steps=config.ns_steps,
             ns_eps=config.ns_eps,
             ns_coeffs=config.ns_coeffs,
+            mhc_residual_identity_mix=config.mhc_residual_identity_mix,
+            mhc_residual_alpha=config.mhc_residual_alpha,
         )
 
         self.hc_attn = init_hc(
@@ -174,6 +176,8 @@ class GPTConfig:
         self.ns_steps = kwargs.pop("ns_steps", 5)
         self.ns_eps = kwargs.pop("ns_eps", 1e-7)
         self.ns_coeffs = kwargs.pop("ns_coeffs", (3.0, -3.2, 1.2))
+        self.mhc_residual_identity_mix = kwargs.pop("mhc_residual_identity_mix", False)
+        self.mhc_residual_alpha = kwargs.pop("mhc_residual_alpha", 0.01)
         self.v_residual = kwargs.pop("v_residual", False)
         self.v_residual_lamb_lr = kwargs.pop("v_residual_lamb_lr", 1e-2)
 

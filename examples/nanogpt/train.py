@@ -69,6 +69,8 @@ mhc_h_res_proj = "sinkhorn"
 ns_steps = 5
 ns_eps = 1e-7
 ns_coeffs = (3.0, -3.2, 1.2)
+mhc_residual_identity_mix = False
+mhc_residual_alpha = 0.01
 
 # value residual config
 v_residual = False
@@ -237,6 +239,7 @@ if dataset == "fineweb10B":
         print(f"Train tokens: {len(train_data):,}, Val tokens: {len(val_data):,}")
 
     vocab_size = 50304  # GPT-2 vocab size rounded up for efficiency
+
 else:
     # Shakespeare char-level (legacy)
     train_path = os.path.join(data_dir, "train.bin")

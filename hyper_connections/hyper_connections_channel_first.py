@@ -79,12 +79,12 @@ class HyperConnections(Module):
         num_residual_streams,
         *,
         dim,
-        branch: Module | None = None,
+        branch=None,
         layer_index = None,
         tanh = True,
         channel_first = True,
         dropout = 0.,
-        residual_transform: Module | None = None, # to support resnet blocks where dimension in not equal to dimension out - usually a residual conv
+        residual_transform = None, # to support resnet blocks where dimension in not equal to dimension out - usually a residual conv
     ):
         """
         Appendix J, Algorithm2 in - https://arxiv.org/abs/2409.19606
@@ -134,9 +134,6 @@ class HyperConnections(Module):
         self.residual_transform = default(residual_transform, nn.Identity())
 
     def width_connection(self, residuals):
-
-        maybe_transformed_residuals = self.residual_transform(residuals)
-
         # width connection
 
         normed = self.norm(residuals)
@@ -161,7 +158,10 @@ class HyperConnections(Module):
 
         branch_input, residuals = mix_h[:, 0, ...], mix_h[:, 1:, ...]
 
-        return branch_input, maybe_transformed_residuals, dict(beta = beta)
+        residuals = rearrange(residuals, 'b s d ... -> (b s) d ...')
+        residuals = self.residual_transform(residuals)
+
+        return branch_input, residuals, dict(beta = beta)
 
     def depth_connection(self, branch_output, residuals, *, beta):
         # 'depth' connection
