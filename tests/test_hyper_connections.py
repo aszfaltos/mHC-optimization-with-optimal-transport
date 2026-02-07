@@ -158,6 +158,90 @@ def test_mhc_H_res_constraints():
     )
 
 
+def test_mhc_orthostochastic_H_res_constraints():
+    from hyper_connections.hyper_connections import (
+        HyperConnections,
+        orthostochastic_project,
+    )
+
+    hc = HyperConnections(
+        num_residual_streams=4,
+        dim=64,
+        mhc=True,
+        mhc_h_res_proj="orthostochastic",
+    )
+
+    H_res = orthostochastic_project(
+        hc.H_res_logits,
+        ns_steps=hc.ns_steps,
+        ns_eps=hc.ns_eps,
+        ns_coeffs=hc.ns_coeffs,
+    )
+
+    assert H_res.min().item() >= 0
+    # Orthostochastic => doubly-stochastic when O is orthogonal; Newton-Schulz
+    # gives an approximation, so use a looser tolerance than Sinkhorn.
+    assert torch.allclose(
+        H_res.sum(dim=-1),
+        torch.ones(4, device=H_res.device, dtype=H_res.dtype),
+        atol=5e-2,
+    )
+    assert torch.allclose(
+        H_res.sum(dim=-2),
+        torch.ones(4, device=H_res.device, dtype=H_res.dtype),
+        atol=5e-2,
+    )
+
+
+def test_mhc_identity_mix_orthostochastic_H_res_constraints():
+    from hyper_connections.hyper_connections import (
+        HyperConnections,
+        orthostochastic_project,
+    )
+
+    hc = HyperConnections(
+        num_residual_streams=4,
+        dim=64,
+        mhc=True,
+        mhc_h_res_proj="orthostochastic",
+        mhc_residual_identity_mix=True,
+        mhc_residual_alpha=0.01,
+    )
+
+    S = orthostochastic_project(
+        hc.H_res_logits,
+        ns_steps=hc.ns_steps,
+        ns_eps=hc.ns_eps,
+        ns_coeffs=hc.ns_coeffs,
+    )
+
+    alpha = torch.sigmoid(hc.H_res_alpha_logit)
+    I = torch.eye(4, device=S.device, dtype=S.dtype)
+    H_res = (1.0 - alpha) * I + alpha * S
+
+    assert H_res.min().item() >= 0
+    assert torch.allclose(
+        H_res.sum(dim=-1),
+        torch.ones(4, device=H_res.device, dtype=H_res.dtype),
+        atol=5e-2,
+    )
+    assert torch.allclose(
+        H_res.sum(dim=-2),
+        torch.ones(4, device=H_res.device, dtype=H_res.dtype),
+        atol=5e-2,
+    )
+
+
+def test_mhc_rejects_multiple_fracs_and_views():
+    from hyper_connections.hyper_connections import HyperConnections
+
+    with pytest.raises(AssertionError):
+        HyperConnections(num_residual_streams=4, dim=64, mhc=True, num_fracs=2)
+
+    with pytest.raises(AssertionError):
+        HyperConnections(num_residual_streams=4, dim=64, mhc=True, num_input_views=2)
+
+
 def test_mhc_H_pre_H_post_constraints():
     from hyper_connections.hyper_connections import HyperConnections
 
@@ -310,6 +394,26 @@ def test_hc_width_connection_applies_residual_mixing():
 
     torch.testing.assert_close(branch_input, torch.zeros(batch, seq, dim))
     torch.testing.assert_close(residuals, torch.cat((x1, x0), dim=0))
+
+
+def test_hc_depth_connection_applies_branch_distribution():
+    from hyper_connections.hyper_connections import HyperConnections
+
+    streams, dim, batch, seq = 2, 4, 1, 3
+    hc = HyperConnections(num_residual_streams=streams, dim=dim)
+
+    branch_output = torch.randn(batch, seq, dim)
+    residuals = torch.zeros(batch * streams, seq, dim)
+
+    # beta has shape (b, seq, f1, s, f2); for num_fracs=1 => f1=f2=1
+    beta = torch.zeros(batch, seq, 1, streams, 1)
+    beta[..., 0, :] = 1.0
+
+    out = hc.depth_connection(branch_output, residuals, beta=beta)
+    out0, out1 = out.chunk(2, dim=0)
+
+    torch.testing.assert_close(out0, branch_output)
+    torch.testing.assert_close(out1, torch.zeros_like(branch_output))
 
 
 def test_hc_channel_first_width_connection_applies_residual_mixing():
