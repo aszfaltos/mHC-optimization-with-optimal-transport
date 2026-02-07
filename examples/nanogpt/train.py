@@ -172,7 +172,12 @@ else:
     master_process = True
     seed_offset = 0
     ddp_world_size = 1
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
 
 torch.manual_seed(seed + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -180,7 +185,11 @@ torch.backends.cudnn.allow_tf32 = True
 device_type = (
     device.type
     if isinstance(device, torch.device)
-    else ("cuda" if "cuda" in device else "cpu")
+    else (
+        "cuda"
+        if "cuda" in device
+        else ("mps" if "mps" in device else "cpu")
+    )
 )
 
 # -----------------------------------------------------------------------------
