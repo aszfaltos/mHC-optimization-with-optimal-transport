@@ -67,14 +67,12 @@ This applies `H_res = (1-α) * I + α * S` where `S` is the projected matrix (Si
 - `train_fineweb10B_vres_mhc*.py` combines vRes + mHC.
 - `train_fineweb10B_cvres_mhc*.py` combines vRes + mHC with `v_residual_constrained=True` (convex mixing via softmax).
 
-### Next steps planned
-- [x] Value residual ablations with baseline/HC/mHC
-- [x] Combined vRes + mHC configs (unconstrained + constrained)
-- [ ] AltUP ablation
-- [x] H^res = `(1−α)*I + α*S` instead of full doubly stochastic
-- [x] Orthostochastic H_res projection (Newton-Schulz) as alternative to Sinkhorn-Knopp
-- [x] Opt-in Newton-Schulz coefficient schedule for orthostochastic projection
-- [ ] U-net-based variants + value embeddings
+### Implemented research
+- Value residual ablations with baseline/HC/mHC
+- Combined vRes + mHC configs (unconstrained + constrained)
+- H^res = `(1−α)*I + α*S` instead of full doubly stochastic
+- Orthostochastic H_res projection (Newton-Schulz) as alternative to Sinkhorn-Knopp
+- Opt-in Newton-Schulz coefficient schedule for orthostochastic projection
 
 
 ### Acknowledgements
