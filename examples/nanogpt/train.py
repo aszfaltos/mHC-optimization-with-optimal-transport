@@ -113,6 +113,7 @@ compile_model = False
 wandb_log = True
 wandb_project = "mhc-nanogpt"
 wandb_run_name = "baseline"
+wandb_group = None
 wandb_log_layer_stats = True
 wandb_log_layer_cosine = True
 
@@ -136,7 +137,8 @@ def get_wandb_variant():
 
 
 wandb_variant = get_wandb_variant()
-wandb_group = f"{dataset}-L{n_layer}-D{n_embd}-H{n_head}"
+if wandb_group is None:
+    wandb_group = f"{dataset}-L{n_layer}-D{n_embd}-H{n_head}"
 if wandb_run_name == "baseline":
     wandb_run_name = f"{dataset}-{wandb_variant}-L{n_layer}-D{n_embd}-H{n_head}-s{seed}"
 wandb_job_type = wandb_variant
