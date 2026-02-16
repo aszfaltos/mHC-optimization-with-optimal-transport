@@ -681,13 +681,15 @@ if master_process:
         )
     total_params = sum(p.numel() for p in raw_model.parameters())
     routing_params = 0
+    # Count only HC/FTR-own params, excluding the wrapped branch (attn/MLP)
     for block in raw_model.transformer.h:
         if block.use_ftr:
             for ftr in (block.ftr_attn, block.ftr_mlp):
                 routing_params += sum(p.numel() for p in ftr.parameters())
         elif hasattr(block, "hc_attn") and isinstance(block.hc_attn, HyperConnections):
             for hc in (block.hc_attn, block.hc_mlp):
-                routing_params += sum(p.numel() for p in hc.parameters())
+                branch_params = set(id(p) for p in hc.branch.parameters()) if hc.branch is not None else set()
+                routing_params += sum(p.numel() for p in hc.parameters() if id(p) not in branch_params)
     print(f"  model params: {total_params:,}")
     if routing_params > 0:
         print(f"  routing params: {routing_params:,} ({routing_params / total_params * 100:.1f}%)")

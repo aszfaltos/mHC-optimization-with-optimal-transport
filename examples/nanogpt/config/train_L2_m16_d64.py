@@ -20,8 +20,8 @@ dropout = 0.0
 bias = False
 
 # training (1B tokens on 3090 24GB)
-batch_size = 32
-gradient_accumulation_steps = 4
+batch_size = 16
+gradient_accumulation_steps = 8
 max_iters = 30000
 eval_interval = 500
 log_interval = 10
