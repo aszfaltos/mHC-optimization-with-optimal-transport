@@ -46,7 +46,6 @@ def test_nanogpt_run_contract_smoke(tmp_path: Path):
     cmd = [
         sys.executable,
         "train.py",
-        "config/train_fineweb10B.py",
         f"out_dir={out_dir}",
         f"data_dir={data_dir}",
         "wandb_log=False",
@@ -66,7 +65,6 @@ def test_nanogpt_run_contract_smoke(tmp_path: Path):
         "gradient_accumulation_steps=1",
         "hc_disable=True",
         "mhc=False",
-        "v_residual=False",
     ]
 
     env = os.environ.copy()

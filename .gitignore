@@ -228,3 +228,8 @@ scripts/
 wandb/
 artifacts/
 diary/
+
+
+CLAUDE.md
+.claude
+*plan.md

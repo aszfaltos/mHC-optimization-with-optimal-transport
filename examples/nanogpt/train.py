@@ -27,7 +27,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from hyper_connections import HyperConnections
+from hyper_connections import HyperConnections, FullTransportRouting
 from model import GPT, GPTConfig
 
 # -----------------------------------------------------------------------------
@@ -38,6 +38,7 @@ eval_interval = 200
 log_interval = 10
 eval_iters = 200
 max_iters = 2000
+checkpoint_interval = 0  # periodic checkpoint every N steps (0 = disabled)
 
 batch_size = 64
 block_size = 256
@@ -69,36 +70,17 @@ dataset = "fineweb10B"
 # to `examples/nanogpt/data/<dataset>`.
 data_dir = None
 
-NS_COEFFS = (
-    (7.2086, -15.5131, 9.0178),
-    (3.9623, -2.5813, 0.4542),
-    (3.9466, -2.5765, 0.4544),
-    (3.8991, -2.5671, 0.4566),
-    (3.7186, -2.5308, 0.4653),
-    (3.1390, -2.3073, 0.4733),
-    (2.1715, -1.5246, 0.3885),
-    (1.8648, -1.2224, 0.3577),
-)
-
-NS_STEPS = len(NS_COEFFS)
-
 # hyper-connections config
 hc_num_streams = 1
-hc_num_fracs = 1
 hc_disable = True
 mhc = False
 sinkhorn_iters = 10
 sinkhorn_tau = 0.05
-mhc_h_res_proj = "sinkhorn"
-ns_steps = 5
-ns_eps = 1e-7
-ns_coeffs = (3.0, -3.2, 1.2)
 mhc_residual_identity_mix = False
 mhc_residual_alpha = 0.01
-
-# value residual config
-v_residual = False
-v_residual_lamb_lr = 1e-2
+routing_granularity = None
+routing_bottleneck_dim = None
+full_transport_routing = False
 
 # dtype: "float32", "bfloat16", "float16"
 dtype = "bfloat16"
@@ -127,12 +109,8 @@ exec(open(os.path.join(os.path.dirname(__file__), "configurator.py")).read())
 
 
 def get_wandb_variant():
-    if v_residual:
-        return "vres"
     if mhc:
         return "mhc"
-    if not hc_disable:
-        return "hc"
     return "baseline"
 
 
@@ -149,7 +127,6 @@ wandb_tags = [
     f"D{n_embd}",
     f"H{n_head}",
     f"streams={hc_num_streams}",
-    f"fracs={hc_num_fracs}",
     f"block={block_size}",
     f"dtype={dtype}",
     f"lr={learning_rate:g}",
@@ -162,13 +139,14 @@ if mhc:
         [
             f"sinkhorn_iters={sinkhorn_iters}",
             f"sinkhorn_tau={sinkhorn_tau:g}",
-            f"mhc_res_proj={mhc_h_res_proj}",
-            f"ns_steps={ns_steps}",
         ]
     )
-
-if v_residual:
-    wandb_tags.append("v_residual")
+    if routing_granularity is not None:
+        wandb_tags.append(f"routing_m={routing_granularity}")
+    if routing_bottleneck_dim is not None:
+        wandb_tags.append(f"routing_d={routing_bottleneck_dim}")
+    if full_transport_routing:
+        wandb_tags.append("ftr")
 
 # -----------------------------------------------------------------------------
 # DDP setup
@@ -352,22 +330,20 @@ def _write_config_effective(*, out_dir_path: Path) -> None:
         "lr_decay_iters",
         "min_lr",
         "max_iters",
+        "checkpoint_interval",
         "batch_size",
         "block_size",
         # hyper-connections
         "hc_num_streams",
-        "hc_num_fracs",
         "hc_disable",
         "mhc",
         "sinkhorn_iters",
         "sinkhorn_tau",
-        "mhc_h_res_proj",
-        "ns_steps",
-        "ns_eps",
-        "ns_coeffs",
-        # v-residual
-        "v_residual",
-        "v_residual_lamb_lr",
+        "mhc_residual_identity_mix",
+        "mhc_residual_alpha",
+        "routing_granularity",
+        "routing_bottleneck_dim",
+        "full_transport_routing",
         # logging
         "wandb_log",
         "wandb_project",
@@ -538,17 +514,15 @@ model_config = GPTConfig(
     dropout=dropout,
     bias=bias,
     hc_num_streams=hc_num_streams,
-    hc_num_fracs=hc_num_fracs,
     hc_disable=hc_disable,
     mhc=mhc,
     sinkhorn_iters=sinkhorn_iters,
     sinkhorn_tau=sinkhorn_tau,
-    mhc_h_res_proj=mhc_h_res_proj,
-    ns_steps=ns_steps,
-    ns_eps=ns_eps,
-    ns_coeffs=ns_coeffs,
-    v_residual=v_residual,
-    v_residual_lamb_lr=v_residual_lamb_lr,
+    mhc_residual_identity_mix=mhc_residual_identity_mix,
+    mhc_residual_alpha=mhc_residual_alpha,
+    routing_granularity=routing_granularity,
+    routing_bottleneck_dim=routing_bottleneck_dim,
+    full_transport_routing=full_transport_routing,
 )
 
 model = GPT(model_config)
@@ -559,15 +533,19 @@ if compile_model:
     model = torch.compile(model)
 
 if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=mhc)
+    model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
 
 raw_model = model.module if ddp else model
 
 if wandb_log and wandb_log_layer_stats:
     for block in raw_model.transformer.h:
-        for hc in (block.hc_attn, block.hc_mlp):
-            if isinstance(hc, HyperConnections):
-                hc.collect_stats = True
+        if block.use_ftr:
+            for ftr in (block.ftr_attn, block.ftr_mlp):
+                ftr.collect_stats = True
+        else:
+            for hc in (block.hc_attn, block.hc_mlp):
+                if isinstance(hc, HyperConnections):
+                    hc.collect_stats = True
 
 optimizer = raw_model.configure_optimizers(
     weight_decay=weight_decay,
@@ -596,11 +574,15 @@ def collect_hc_layer_stats():
     layer_count = len(raw_model.transformer.h) * 2
     layer_stats = {}
     for block_idx, block in enumerate(raw_model.transformer.h):
-        for sub_idx, hc in enumerate((block.hc_attn, block.hc_mlp)):
-            if not hasattr(hc, "last_stats"):
+        if block.use_ftr:
+            modules = (block.ftr_attn, block.ftr_mlp)
+        else:
+            modules = (block.hc_attn, block.hc_mlp)
+        for sub_idx, mod in enumerate(modules):
+            if not hasattr(mod, "last_stats"):
                 continue
             layer_index = block_idx * 2 + sub_idx
-            for key, value in hc.last_stats.items():
+            for key, value in mod.last_stats.items():
                 layer_stats.setdefault(key, [None] * layer_count)
                 layer_stats[key][layer_index] = value.item()
     return layer_stats
@@ -697,7 +679,18 @@ if master_process:
         print(
             f"  world_size={ddp_world_size}, grad_accum_steps={gradient_accumulation_steps}"
         )
-    print(f"  model params: {sum(p.numel() for p in raw_model.parameters()):,}")
+    total_params = sum(p.numel() for p in raw_model.parameters())
+    routing_params = 0
+    for block in raw_model.transformer.h:
+        if block.use_ftr:
+            for ftr in (block.ftr_attn, block.ftr_mlp):
+                routing_params += sum(p.numel() for p in ftr.parameters())
+        elif hasattr(block, "hc_attn") and isinstance(block.hc_attn, HyperConnections):
+            for hc in (block.hc_attn, block.hc_mlp):
+                routing_params += sum(p.numel() for p in hc.parameters())
+    print(f"  model params: {total_params:,}")
+    if routing_params > 0:
+        print(f"  routing params: {routing_params:,} ({routing_params / total_params * 100:.1f}%)")
     print()
 
 if wandb_log and master_process:
@@ -729,22 +722,21 @@ try:
             "learning_rate": learning_rate,
             "max_iters": max_iters,
             "hc_num_streams": hc_num_streams,
-            "hc_num_fracs": hc_num_fracs,
             "hc_disable": hc_disable,
             "mhc": mhc,
             "sinkhorn_iters": sinkhorn_iters,
             "sinkhorn_tau": sinkhorn_tau,
-            "mhc_h_res_proj": mhc_h_res_proj,
-            "ns_steps": ns_steps,
-            "ns_eps": ns_eps,
-            "ns_coeffs": ns_coeffs,
-            "v_residual": v_residual,
-            "v_residual_lamb_lr": v_residual_lamb_lr,
+            "routing_granularity": routing_granularity,
+            "routing_bottleneck_dim": routing_bottleneck_dim,
+            "full_transport_routing": full_transport_routing,
             "dtype": dtype,
             "world_size": ddp_world_size,
             "tokens_per_iter": tokens_per_iter,
             "wandb_log_layer_stats": wandb_log_layer_stats,
             "wandb_log_layer_cosine": wandb_log_layer_cosine,
+            "total_params": total_params,
+            "routing_params": routing_params,
+            "routing_overhead_pct": routing_params / total_params * 100 if routing_params > 0 else 0,
         },
         )
 
@@ -790,6 +782,22 @@ try:
                     "best_val_loss": best_val_loss,
                 }
                 torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
+
+        # periodic checkpoint for transport analysis
+        if (
+            checkpoint_interval > 0
+            and iter_num > 0
+            and iter_num % checkpoint_interval == 0
+            and master_process
+        ):
+            os.makedirs(out_dir, exist_ok=True)
+            checkpoint = {
+                "model": raw_model.state_dict(),
+                "config": model_config.__dict__,
+                "iter_num": iter_num,
+                "best_val_loss": best_val_loss,
+            }
+            torch.save(checkpoint, os.path.join(out_dir, f"ckpt_{iter_num}.pt"))
 
         t0 = time.time()
 
@@ -862,6 +870,17 @@ try:
                     torch.cuda.reset_peak_memory_stats()
 
         iter_num += 1
+
+    # save final checkpoint
+    if master_process:
+        os.makedirs(out_dir, exist_ok=True)
+        checkpoint = {
+            "model": raw_model.state_dict(),
+            "config": model_config.__dict__,
+            "iter_num": iter_num,
+            "best_val_loss": best_val_loss,
+        }
+        torch.save(checkpoint, os.path.join(out_dir, "ckpt_final.pt"))
 
     run_success = True
 except Exception:

@@ -4,8 +4,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from hyper_connections import get_init_and_expand_reduce_stream_functions
-from value_residual import ValueResidualState
+from hyper_connections import get_init_and_expand_reduce_stream_functions, FullTransportRouting
 
 
 class LayerNorm(nn.Module):
@@ -33,14 +32,6 @@ class CausalSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
 
-        self.v_residual = config.v_residual
-        if self.v_residual:
-            self.lamb1 = nn.Parameter(torch.tensor(0.5))
-            self.lamb2 = nn.Parameter(torch.tensor(0.5))
-        else:
-            self.lamb1 = 1.0
-            self.lamb2 = 0.0
-
         self.flash = hasattr(F, "scaled_dot_product_attention")
         if not self.flash:
             bias = torch.tril(torch.ones(config.block_size, config.block_size))
@@ -48,7 +39,7 @@ class CausalSelfAttention(nn.Module):
                 "bias", bias.view(1, 1, config.block_size, config.block_size)
             )
 
-    def forward(self, x, vrl_state=None):
+    def forward(self, x):
         b, t, c = x.size()
 
         qkv = self.c_attn(x)
@@ -57,11 +48,6 @@ class CausalSelfAttention(nn.Module):
         q = q.view(b, t, self.n_head, self.head_dim)
         k = k.view(b, t, self.n_head, self.head_dim)
         v = v.view(b, t, self.n_head, self.head_dim)
-
-        if self.v_residual:
-            if vrl_state is None:
-                raise ValueError("v_residual requires vrl_state")
-            v = vrl_state.mix(v, self.lamb1, self.lamb2)
 
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
@@ -104,17 +90,6 @@ class MLP(nn.Module):
         return x
 
 
-class AttnBranch(nn.Module):
-    def __init__(self, norm, attn):
-        super().__init__()
-        self.norm = norm
-        self.attn = attn
-
-    def forward(self, x, vrl_state=None):
-        x = self.norm(x)
-        return self.attn(x, vrl_state=vrl_state)
-
-
 class Block(nn.Module):
     def __init__(self, config, layer_idx, init_hc):
         super().__init__()
@@ -122,36 +97,57 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
-        self.attn_branch = AttnBranch(self.ln_1, self.attn)
 
-        hc_kwargs = dict(
-            mhc=config.mhc,
-            sinkhorn_iters=config.sinkhorn_iters,
-            sinkhorn_tau=config.sinkhorn_tau,
-            mhc_h_res_proj=config.mhc_h_res_proj,
-            ns_steps=config.ns_steps,
-            ns_eps=config.ns_eps,
-            ns_coeffs=config.ns_coeffs,
-            mhc_residual_identity_mix=config.mhc_residual_identity_mix,
-            mhc_residual_alpha=config.mhc_residual_alpha,
-        )
+        self.use_ftr = config.full_transport_routing
 
-        self.hc_attn = init_hc(
-            dim=config.n_embd,
-            branch=self.attn_branch,
-            layer_index=layer_idx * 2,
-            **hc_kwargs,
-        )
+        if self.use_ftr:
+            assert config.routing_granularity is not None, (
+                "full_transport_routing requires routing_granularity"
+            )
+            assert config.routing_bottleneck_dim is not None, (
+                "full_transport_routing requires routing_bottleneck_dim"
+            )
+            ftr_kwargs = dict(
+                dim=config.n_embd,
+                m=config.routing_granularity,
+                d=config.routing_bottleneck_dim,
+                n_streams=config.hc_num_streams,
+                sinkhorn_iters=config.sinkhorn_iters,
+                sinkhorn_tau=config.sinkhorn_tau,
+            )
+            self.ftr_attn = FullTransportRouting(**ftr_kwargs)
+            self.ftr_mlp = FullTransportRouting(**ftr_kwargs)
+        else:
+            hc_kwargs = dict(
+                mhc=config.mhc,
+                sinkhorn_iters=config.sinkhorn_iters,
+                sinkhorn_tau=config.sinkhorn_tau,
+                mhc_residual_identity_mix=config.mhc_residual_identity_mix,
+                mhc_residual_alpha=config.mhc_residual_alpha,
+                routing_granularity=config.routing_granularity,
+                routing_bottleneck_dim=config.routing_bottleneck_dim,
+            )
 
-        self.hc_mlp = init_hc(
-            dim=config.n_embd,
-            branch=nn.Sequential(self.ln_2, self.mlp),
-            layer_index=layer_idx * 2 + 1,
-            **hc_kwargs,
-        )
+            self.hc_attn = init_hc(
+                dim=config.n_embd,
+                branch=nn.Sequential(self.ln_1, self.attn),
+                layer_index=layer_idx * 2,
+                **hc_kwargs,
+            )
 
-    def forward(self, x, vrl_state=None):
-        x = self.hc_attn(x, vrl_state=vrl_state)
+            self.hc_mlp = init_hc(
+                dim=config.n_embd,
+                branch=nn.Sequential(self.ln_2, self.mlp),
+                layer_index=layer_idx * 2 + 1,
+                **hc_kwargs,
+            )
+
+    def forward(self, x):
+        if self.use_ftr:
+            x = self.ftr_attn(x, lambda inp: self.attn(self.ln_1(inp)))
+            x = self.ftr_mlp(x, lambda inp: self.mlp(self.ln_2(inp)))
+            return x
+        x = self.hc_attn(x)
         x = self.hc_mlp(x)
         return x
 
@@ -167,19 +163,15 @@ class GPTConfig:
         self.bias = kwargs.pop("bias", True)
 
         self.hc_num_streams = kwargs.pop("hc_num_streams", 1)
-        self.hc_num_fracs = kwargs.pop("hc_num_fracs", 1)
         self.hc_disable = kwargs.pop("hc_disable", False)
         self.mhc = kwargs.pop("mhc", False)
         self.sinkhorn_iters = kwargs.pop("sinkhorn_iters", 10)
         self.sinkhorn_tau = kwargs.pop("sinkhorn_tau", 0.05)
-        self.mhc_h_res_proj = kwargs.pop("mhc_h_res_proj", "sinkhorn")
-        self.ns_steps = kwargs.pop("ns_steps", 5)
-        self.ns_eps = kwargs.pop("ns_eps", 1e-7)
-        self.ns_coeffs = kwargs.pop("ns_coeffs", (3.0, -3.2, 1.2))
         self.mhc_residual_identity_mix = kwargs.pop("mhc_residual_identity_mix", False)
         self.mhc_residual_alpha = kwargs.pop("mhc_residual_alpha", 0.01)
-        self.v_residual = kwargs.pop("v_residual", False)
-        self.v_residual_lamb_lr = kwargs.pop("v_residual_lamb_lr", 1e-2)
+        self.routing_granularity = kwargs.pop("routing_granularity", None)
+        self.routing_bottleneck_dim = kwargs.pop("routing_bottleneck_dim", None)
+        self.full_transport_routing = kwargs.pop("full_transport_routing", False)
 
         for key, value in kwargs.items():
             setattr(self, key, value)
@@ -192,12 +184,10 @@ class GPT(nn.Module):
         assert config.block_size is not None
 
         self.config = config
-        self.vrl_state = ValueResidualState() if config.v_residual else None
 
         init_hc, expand_stream, reduce_stream = (
             get_init_and_expand_reduce_stream_functions(
                 config.hc_num_streams,
-                num_fracs=config.hc_num_fracs,
                 disable=config.hc_disable,
             )
         )
@@ -248,12 +238,8 @@ class GPT(nn.Module):
         x = self.transformer.drop(tok_emb + pos_emb)
         x = self.expand_stream(x)
 
-        vrl_state = self.vrl_state
-        if vrl_state is not None:
-            vrl_state.reset()
-
         for block in self.transformer.h:
-            x = block(x, vrl_state=vrl_state)
+            x = block(x)
 
         x = self.transformer.ln_f(x)
         x = self.reduce_stream(x)
@@ -286,13 +272,9 @@ class GPT(nn.Module):
 
         decay = {pn for pn in decay if pn in param_dict}
         no_decay = {pn for pn in no_decay if pn in param_dict}
-        lamb_params = {pn for pn in param_dict if "lamb" in pn}
-
-        decay -= lamb_params
-        no_decay -= lamb_params
 
         assert len(decay & no_decay) == 0
-        assert len(param_dict.keys() - (decay | no_decay | lamb_params)) == 0
+        assert len(param_dict.keys() - (decay | no_decay)) == 0
 
         optim_groups = [
             {
@@ -304,17 +286,6 @@ class GPT(nn.Module):
                 "weight_decay": 0.0,
             },
         ]
-
-        if lamb_params:
-            lamb_lr = self.config.v_residual_lamb_lr
-            optim_groups.append(
-                {
-                    "params": [param_dict[pn] for pn in sorted(lamb_params)],
-                    "weight_decay": 0.0,
-                    "lr": lamb_lr,
-                    "lr_scale": lamb_lr / learning_rate,
-                }
-            )
 
         use_fused = (
             device_type == "cuda"

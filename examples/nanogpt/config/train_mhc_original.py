@@ -1,0 +1,54 @@
+# L0: Original mHC with n=4 (unmodified routing, m=n=4)
+# Baseline comparison for original mHC at 32M scale
+#
+# Usage:
+#   python train.py config/train_mhc_original.py --seed=42
+
+out_dir = "out-mhc-original"
+wandb_run_name = "mhc_original"
+wandb_project = "fine-grained-routing"
+
+dataset = "fineweb10B"
+
+# model
+n_layer = 24
+n_head = 8
+n_embd = 256
+block_size = 256
+dropout = 0.0
+bias = False
+
+# training (1B tokens on 3090 24GB)
+batch_size = 256
+gradient_accumulation_steps = 1
+max_iters = 15000
+eval_interval = 500
+log_interval = 10
+eval_iters = 100
+checkpoint_interval = 5000
+
+# optimizer
+learning_rate = 6e-4
+weight_decay = 0.1
+beta1 = 0.9
+beta2 = 0.95
+grad_clip = 1.0
+
+# lr schedule
+warmup_iters = 500
+lr_decay_iters = 15000
+min_lr = 6e-5
+
+# dtype
+dtype = "bfloat16"
+
+# Original mHC: n=4, m defaults to n=4
+hc_num_streams = 4
+hc_num_fracs = 1
+hc_disable = False
+mhc = True
+sinkhorn_iters = 10
+sinkhorn_tau = 0.05
+mhc_h_res_proj = "sinkhorn"
+mhc_residual_identity_mix = False
+mhc_residual_alpha = 0.01
