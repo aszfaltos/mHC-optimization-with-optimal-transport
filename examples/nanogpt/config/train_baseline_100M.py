@@ -19,10 +19,10 @@ block_size = 256
 dropout = 0.0
 bias = False
 
-# training (1B tokens on 3090 24GB, reduced batch for memory)
-batch_size = 128
-gradient_accumulation_steps = 2  # effective batch = 256
-max_iters = 15000
+# training (1B tokens on 3090 24GB)
+batch_size = 32
+gradient_accumulation_steps = 4
+max_iters = 30000
 eval_interval = 500
 log_interval = 10
 eval_iters = 100
@@ -37,7 +37,7 @@ grad_clip = 1.0
 
 # lr schedule
 warmup_iters = 500
-lr_decay_iters = 15000
+lr_decay_iters = 30000
 min_lr = 6e-5
 
 # dtype

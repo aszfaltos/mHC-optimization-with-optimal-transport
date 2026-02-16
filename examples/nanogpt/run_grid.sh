@@ -40,7 +40,7 @@ build_L0() {
     local -n _jobs=$1
     for config in baseline_32M baseline_50M baseline_100M mhc_original; do
         for seed in "${SEEDS_BASELINE[@]}"; do
-            _jobs+=("python train.py config/train_${config}.py --seed=$seed --wandb_run_name=L0_${config}_s${seed} --out_dir=out-L0-${config}-s${seed}")
+            _jobs+=("uv run python train.py config/train_${config}.py --seed=$seed --wandb_run_name=L0_${config}_s${seed} --out_dir=out-L0-${config}-s${seed}")
         done
     done
 }
@@ -51,7 +51,7 @@ build_L1() {
     local -n _jobs=$1
     for m in 4 8 16 32; do
         for seed in "${SEEDS[@]}"; do
-            _jobs+=("python train.py config/train_L1_m${m}.py --seed=$seed --wandb_run_name=L1_m${m}_s${seed} --out_dir=out-L1-m${m}-s${seed}")
+            _jobs+=("uv run python train.py config/train_L1_m${m}.py --seed=$seed --wandb_run_name=L1_m${m}_s${seed} --out_dir=out-L1-m${m}-s${seed}")
         done
     done
 }
@@ -62,7 +62,7 @@ build_L2() {
     local -n _jobs=$1
     for d in 4 8 16 32 64 256; do
         for seed in "${SEEDS[@]}"; do
-            _jobs+=("python train.py config/train_L2_m16_d${d}.py --seed=$seed --wandb_run_name=L2_m16_d${d}_s${seed} --out_dir=out-L2-m16-d${d}-s${seed}")
+            _jobs+=("uv run python train.py config/train_L2_m16_d${d}.py --seed=$seed --wandb_run_name=L2_m16_d${d}_s${seed} --out_dir=out-L2-m16-d${d}-s${seed}")
         done
     done
 }
