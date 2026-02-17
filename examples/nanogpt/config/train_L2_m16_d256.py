@@ -23,7 +23,7 @@ bias = False
 # training (1B tokens on 3090 24GB)
 batch_size = 16
 gradient_accumulation_steps = 8
-max_iters = 30000
+max_iters = 5000
 eval_interval = 500
 log_interval = 10
 eval_iters = 100
