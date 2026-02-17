@@ -37,13 +37,15 @@ def default(v, d):
 
 # core: log-domain Sinkhorn (doubly stochastic projection)
 
+try:
+    from hyper_connections.triton_sinkhorn import triton_sinkhorn as _triton_sinkhorn
+    _HAS_TRITON_SINKHORN = True
+except ImportError:
+    _HAS_TRITON_SINKHORN = False
 
-def sinkhorn_log(logits, num_iters=10, tau=0.05):
-    """Project logits onto the set of doubly stochastic matrices via Sinkhorn.
 
-    Operates in log-space for numerical stability.  Accepts batched inputs
-    ``(..., m, m)`` and returns ``exp(...) * n`` so that row/col sums ≈ 1.
-    """
+def _sinkhorn_log_pytorch(logits, num_iters=10, tau=0.05):
+    """Pure-PyTorch log-domain Sinkhorn (fallback when Triton unavailable)."""
     n = logits.shape[-1]
     Z = logits / tau
 
@@ -57,6 +59,20 @@ def sinkhorn_log(logits, num_iters=10, tau=0.05):
         v = log_marginal - torch.logsumexp(Z + u.unsqueeze(-1), dim=-2)
 
     return torch.exp(Z + u.unsqueeze(-1) + v.unsqueeze(-2)) * n
+
+
+def sinkhorn_log(logits, num_iters=10, tau=0.05):
+    """Project logits onto the set of doubly stochastic matrices via Sinkhorn.
+
+    Operates in log-space for numerical stability.  Accepts batched inputs
+    ``(..., r, c)`` and returns ``exp(...) * n`` so that row/col sums ≈ 1.
+
+    Uses a fused Triton kernel on CUDA when available, otherwise falls back
+    to the pure-PyTorch implementation.
+    """
+    if _HAS_TRITON_SINKHORN and logits.is_cuda:
+        return _triton_sinkhorn(logits, num_iters, tau)
+    return _sinkhorn_log_pytorch(logits, num_iters, tau)
 
 
 # norms

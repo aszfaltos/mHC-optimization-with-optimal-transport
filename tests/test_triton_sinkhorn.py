@@ -1,0 +1,299 @@
+"""Correctness tests and benchmarks for the fused Triton Sinkhorn kernel.
+
+Run tests:   uv run pytest tests/test_triton_sinkhorn.py -v
+Run bench:   uv run python tests/test_triton_sinkhorn.py
+"""
+from __future__ import annotations
+
+import math
+import sys
+import time
+
+import pytest
+import torch
+
+# PyTorch reference (always available, no Triton needed)
+from hyper_connections.hyper_connections import _sinkhorn_log_pytorch
+
+# Triton kernel (may not be available on CPU-only machines)
+try:
+    from hyper_connections.triton_sinkhorn import triton_sinkhorn, is_available as triton_available
+except ImportError:
+    triton_available = lambda: False
+    triton_sinkhorn = None
+
+requires_triton = pytest.mark.skipif(
+    not torch.cuda.is_available() or triton_sinkhorn is None or not triton_available(),
+    reason="Triton + CUDA required",
+)
+
+
+# ========================================================================== #
+#  Correctness tests
+# ========================================================================== #
+
+
+@requires_triton
+@pytest.mark.parametrize("m", [4, 8, 16, 32])
+@pytest.mark.parametrize("tau", [0.05, 0.1])
+def test_forward_matches_pytorch(m, tau):
+    """Triton forward matches PyTorch sinkhorn_log to tight tolerance."""
+    torch.manual_seed(42)
+    logits = torch.randn(64, m, m, device="cuda")
+
+    out_triton = triton_sinkhorn(logits, num_iters=20, tau=tau)
+    out_ref = _sinkhorn_log_pytorch(logits, num_iters=20, tau=tau)
+
+    torch.testing.assert_close(out_triton, out_ref, atol=1e-4, rtol=1e-4)
+
+
+@requires_triton
+@pytest.mark.parametrize("m", [4, 8, 16, 32])
+def test_doubly_stochastic(m):
+    """Output / n has row and col sums ≈ 1."""
+    torch.manual_seed(0)
+    logits = torch.randn(32, m, m, device="cuda")
+    P = triton_sinkhorn(logits, num_iters=20, tau=0.05)
+    P_norm = P / m
+
+    ones_row = torch.ones(32, m, device="cuda")
+    ones_col = torch.ones(32, m, device="cuda")
+    torch.testing.assert_close(P_norm.sum(dim=-1), ones_row, atol=1e-3, rtol=0)
+    torch.testing.assert_close(P_norm.sum(dim=-2), ones_col, atol=1e-3, rtol=0)
+
+
+@requires_triton
+def test_gradcheck():
+    """Triton backward matches finite-difference gradcheck (float64)."""
+    torch.manual_seed(1)
+    logits = torch.randn(4, 8, 8, device="cuda", dtype=torch.float64, requires_grad=True)
+
+    def fn(x):
+        return triton_sinkhorn(x, num_iters=20, tau=0.1)
+
+    torch.autograd.gradcheck(fn, logits, eps=1e-6, atol=1e-3, rtol=1e-3)
+
+
+@requires_triton
+@pytest.mark.parametrize("m", [4, 8, 16, 32])
+def test_backward_matches_pytorch(m):
+    """Triton gradient matches PyTorch autograd gradient."""
+    torch.manual_seed(7)
+    logits = torch.randn(32, m, m, device="cuda", dtype=torch.float32)
+
+    # PyTorch reference gradient
+    logits_ref = logits.clone().requires_grad_(True)
+    out_ref = _sinkhorn_log_pytorch(logits_ref, num_iters=20, tau=0.05)
+    loss_ref = out_ref.sum()
+    loss_ref.backward()
+
+    # Triton gradient
+    logits_tri = logits.clone().requires_grad_(True)
+    out_tri = triton_sinkhorn(logits_tri, num_iters=20, tau=0.05)
+    loss_tri = out_tri.sum()
+    loss_tri.backward()
+
+    torch.testing.assert_close(
+        logits_tri.grad, logits_ref.grad, atol=1e-3, rtol=1e-3
+    )
+
+
+@requires_triton
+def test_backward_gradient_flow():
+    """Gradients propagate and have reasonable magnitude."""
+    torch.manual_seed(2)
+    logits = torch.randn(32, 16, 16, device="cuda", requires_grad=True)
+    P = triton_sinkhorn(logits, num_iters=20, tau=0.05)
+    P.sum().backward()
+
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
+    assert logits.grad.abs().max() > 0
+
+
+@requires_triton
+def test_bf16_autocast():
+    """Works correctly under bf16 autocast."""
+    torch.manual_seed(3)
+    logits = torch.randn(32, 16, 16, device="cuda")
+
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        P_bf16 = triton_sinkhorn(logits.to(torch.bfloat16), num_iters=20, tau=0.05)
+    assert P_bf16.dtype == torch.bfloat16
+
+    P_fp32 = triton_sinkhorn(logits, num_iters=20, tau=0.05)
+    torch.testing.assert_close(P_bf16.float(), P_fp32, atol=5e-2, rtol=1e-2)
+
+
+@requires_triton
+@pytest.mark.parametrize(
+    "shape",
+    [(16, 16), (4, 8, 16, 16), (2, 3, 4, 8, 8)],
+    ids=["2d", "4d", "5d"],
+)
+def test_batched_leading_dims(shape):
+    """Works with arbitrary leading batch dims (..., rows, cols)."""
+    torch.manual_seed(4)
+    logits = torch.randn(*shape, device="cuda", requires_grad=True)
+    P = triton_sinkhorn(logits, num_iters=20, tau=0.05)
+    assert P.shape == logits.shape
+    P.sum().backward()
+    assert logits.grad is not None
+    assert logits.grad.shape == logits.shape
+
+
+@requires_triton
+def test_numerical_stability():
+    """No NaN/Inf with large logits (typical regime: logits * 5 / tau=0.05 → Z ~ 500)."""
+    torch.manual_seed(5)
+    logits = torch.randn(32, 16, 16, device="cuda") * 5
+    P = triton_sinkhorn(logits, num_iters=20, tau=0.05)
+    assert torch.isfinite(P).all(), f"Non-finite values in output: {P}"
+
+
+@requires_triton
+@pytest.mark.parametrize(
+    "rows,cols",
+    [(4, 16), (16, 4), (8, 32), (32, 8)],
+    ids=["4x16", "16x4", "8x32", "32x8"],
+)
+def test_rectangular(rows, cols):
+    """Non-square matrices matching FTR H^pre (k×m) and H^post (m×k)."""
+    torch.manual_seed(6)
+    logits = torch.randn(32, rows, cols, device="cuda")
+
+    out_triton = triton_sinkhorn(logits, num_iters=20, tau=0.05)
+    out_ref = _sinkhorn_log_pytorch(logits, num_iters=20, tau=0.05)
+
+    assert out_triton.shape == (32, rows, cols)
+    torch.testing.assert_close(out_triton, out_ref, atol=1e-4, rtol=1e-4)
+
+
+@requires_triton
+def test_rectangular_gradients():
+    """Gradients flow through rectangular Sinkhorn."""
+    torch.manual_seed(8)
+    logits = torch.randn(16, 4, 16, device="cuda", requires_grad=True)
+    P = triton_sinkhorn(logits, num_iters=20, tau=0.05)
+    P.sum().backward()
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
+
+
+@requires_triton
+def test_single_matrix():
+    """Works with a single matrix (no batch dim beyond the 2d matrix)."""
+    torch.manual_seed(9)
+    logits = torch.randn(8, 8, device="cuda", requires_grad=True)
+    P = triton_sinkhorn(logits, num_iters=20, tau=0.05)
+    assert P.shape == (8, 8)
+    P.sum().backward()
+    assert logits.grad is not None
+
+
+@requires_triton
+def test_dispatcher_uses_triton():
+    """The sinkhorn_log dispatcher should route CUDA tensors to Triton."""
+    from hyper_connections.hyper_connections import sinkhorn_log, _HAS_TRITON_SINKHORN
+
+    assert _HAS_TRITON_SINKHORN, "Triton import failed in hyper_connections.py"
+
+    torch.manual_seed(10)
+    logits = torch.randn(8, 16, 16, device="cuda")
+
+    # sinkhorn_log should produce same result as triton_sinkhorn
+    out_dispatch = sinkhorn_log(logits, num_iters=20, tau=0.05)
+    out_triton = triton_sinkhorn(logits, num_iters=20, tau=0.05)
+    torch.testing.assert_close(out_dispatch, out_triton)
+
+
+# ========================================================================== #
+#  Benchmark (run as standalone script)
+# ========================================================================== #
+
+
+def _time_fn(fn, warmup=10, repeat=100):
+    """Time a CUDA function with proper synchronization."""
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+
+    t0 = time.perf_counter()
+    for _ in range(repeat):
+        fn()
+    torch.cuda.synchronize()
+    return (time.perf_counter() - t0) / repeat
+
+
+def benchmark():
+    assert torch.cuda.is_available(), "CUDA required for benchmarks"
+    assert triton_sinkhorn is not None, "Triton kernel not available"
+
+    print("=" * 80)
+    print("Fused Triton Sinkhorn Benchmark")
+    print("=" * 80)
+
+    configs = [
+        # (batch, rows, cols, iters, label)
+        (256, 4, 4, 20, "B=256  m=4   square"),
+        (256, 8, 8, 20, "B=256  m=8   square"),
+        (256, 16, 16, 20, "B=256  m=16  square"),
+        (256, 32, 32, 20, "B=256  m=32  square"),
+        (2048, 4, 4, 20, "B=2048 m=4   square"),
+        (2048, 8, 8, 20, "B=2048 m=8   square"),
+        (2048, 16, 16, 20, "B=2048 m=16  square"),
+        (2048, 32, 32, 20, "B=2048 m=32  square"),
+        (4096, 4, 4, 20, "B=4096 m=4   square"),
+        (4096, 8, 8, 20, "B=4096 m=8   square"),
+        (4096, 16, 16, 20, "B=4096 m=16  square"),
+        (4096, 32, 32, 20, "B=4096 m=32  square"),
+        # Rectangular (FTR-like)
+        (2048, 4, 16, 20, "B=2048 4×16  rect"),
+        (2048, 16, 4, 20, "B=2048 16×4  rect"),
+    ]
+
+    print(f"\n{'Config':<28} {'Triton fwd':>12} {'PyTorch fwd':>12} {'Speedup':>8}")
+    print("-" * 64)
+
+    for B, R, C, iters, label in configs:
+        logits = torch.randn(B, R, C, device="cuda")
+
+        t_triton = _time_fn(lambda: triton_sinkhorn(logits, iters, 0.05))
+        t_pytorch = _time_fn(lambda: _sinkhorn_log_pytorch(logits, iters, 0.05))
+
+        speedup = t_pytorch / t_triton if t_triton > 0 else float("inf")
+        print(
+            f"{label:<28} {t_triton*1e3:>10.3f}ms {t_pytorch*1e3:>10.3f}ms {speedup:>7.1f}x"
+        )
+
+    # Forward + backward
+    print(f"\n{'Config':<28} {'Triton f+b':>12} {'PyTorch f+b':>12} {'Speedup':>8}")
+    print("-" * 64)
+
+    for B, R, C, iters, label in configs:
+        logits_t = torch.randn(B, R, C, device="cuda", requires_grad=True)
+        logits_p = logits_t.detach().clone().requires_grad_(True)
+
+        def triton_fwd_bwd():
+            out = triton_sinkhorn(logits_t, iters, 0.05)
+            out.sum().backward()
+            logits_t.grad = None
+
+        def pytorch_fwd_bwd():
+            out = _sinkhorn_log_pytorch(logits_p, iters, 0.05)
+            out.sum().backward()
+            logits_p.grad = None
+
+        t_triton = _time_fn(triton_fwd_bwd)
+        t_pytorch = _time_fn(pytorch_fwd_bwd)
+
+        speedup = t_pytorch / t_triton if t_triton > 0 else float("inf")
+        print(
+            f"{label:<28} {t_triton*1e3:>10.3f}ms {t_pytorch*1e3:>10.3f}ms {speedup:>7.1f}x"
+        )
+
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    benchmark()
