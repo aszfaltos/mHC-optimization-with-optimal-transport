@@ -114,6 +114,7 @@ class Block(nn.Module):
                 n_streams=config.hc_num_streams,
                 sinkhorn_iters=config.sinkhorn_iters,
                 sinkhorn_tau=config.sinkhorn_tau,
+                sinkhorn_checkpoint=config.sinkhorn_checkpoint,
             )
             self.ftr_attn = FullTransportRouting(**ftr_kwargs)
             self.ftr_mlp = FullTransportRouting(**ftr_kwargs)
@@ -126,6 +127,7 @@ class Block(nn.Module):
                 mhc_residual_alpha=config.mhc_residual_alpha,
                 routing_granularity=config.routing_granularity,
                 routing_bottleneck_dim=config.routing_bottleneck_dim,
+                sinkhorn_checkpoint=config.sinkhorn_checkpoint,
             )
 
             self.hc_attn = init_hc(
@@ -172,6 +174,7 @@ class GPTConfig:
         self.routing_granularity = kwargs.pop("routing_granularity", None)
         self.routing_bottleneck_dim = kwargs.pop("routing_bottleneck_dim", None)
         self.full_transport_routing = kwargs.pop("full_transport_routing", False)
+        self.sinkhorn_checkpoint = kwargs.pop("sinkhorn_checkpoint", False)
 
         for key, value in kwargs.items():
             setattr(self, key, value)

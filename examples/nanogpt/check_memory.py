@@ -1,8 +1,11 @@
-"""Estimate peak GPU memory for a training config (single forward+backward pass).
+"""Estimate peak GPU memory and step time for a training config.
+
+Runs a few warmup iterations then times a forward+backward+step cycle.
 
 Usage:
     uv run python check_memory.py config/train_baseline_32M.py
     uv run python check_memory.py config/train_L1_m16.py --batch_size=8
+    uv run python check_memory.py config/train_L1_m16.py --sinkhorn_checkpoint
 """
 
 import os
@@ -15,8 +18,11 @@ import torch
 from examples.nanogpt.model import GPT, GPTConfig
 from hyper_connections import HyperConnections
 
+WARMUP_ITERS = 3
+BENCH_ITERS = 10
 
-def check_memory(config_path: str, batch_size_override: int | None = None):
+
+def check_memory(config_path: str, batch_size_override: int | None = None, sinkhorn_checkpoint: bool | None = None):
     # ---- load config via exec (same as train.py) ----
     cfg = {}
     exec(open(config_path).read(), cfg)
@@ -25,6 +31,8 @@ def check_memory(config_path: str, batch_size_override: int | None = None):
     block_size = cfg.get("block_size", 256)
     dtype_str = cfg.get("dtype", "bfloat16")
     ptdtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[dtype_str]
+
+    sk_ckpt = sinkhorn_checkpoint if sinkhorn_checkpoint is not None else cfg.get("sinkhorn_checkpoint", False)
 
     model_config = GPTConfig(
         block_size=block_size,
@@ -44,6 +52,7 @@ def check_memory(config_path: str, batch_size_override: int | None = None):
         routing_granularity=cfg.get("routing_granularity", None),
         routing_bottleneck_dim=cfg.get("routing_bottleneck_dim", None),
         full_transport_routing=cfg.get("full_transport_routing", False),
+        sinkhorn_checkpoint=sk_ckpt,
     )
 
     device = "cuda"
@@ -64,20 +73,38 @@ def check_memory(config_path: str, batch_size_override: int | None = None):
     )
     after_optimizer = torch.cuda.max_memory_allocated(device)
 
-    # ---- single forward + backward ----
     ctx = torch.amp.autocast(device_type="cuda", dtype=ptdtype)
-    x = torch.randint(0, 50304, (batch_size, block_size), device=device)
-    y = torch.randint(0, 50304, (batch_size, block_size), device=device)
 
-    optimizer.zero_grad(set_to_none=True)
-    with ctx:
-        _, loss = model(x, y)
-    loss.backward()
-    after_backward = torch.cuda.max_memory_allocated(device)
+    def train_step():
+        x = torch.randint(0, 50304, (batch_size, block_size), device=device)
+        y = torch.randint(0, 50304, (batch_size, block_size), device=device)
+        optimizer.zero_grad(set_to_none=True)
+        with ctx:
+            _, loss = model(x, y)
+        loss.backward()
+        optimizer.step()
+        return loss.item()
 
-    # ---- optimizer step ----
-    optimizer.step()
-    after_step = torch.cuda.max_memory_allocated(device)
+    # ---- warmup (also triggers lazy optimizer state alloc) ----
+    for _ in range(WARMUP_ITERS):
+        train_step()
+
+    after_warmup = torch.cuda.max_memory_allocated(device)
+
+    # ---- timed benchmark ----
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    start.record()
+    for _ in range(BENCH_ITERS):
+        train_step()
+    end.record()
+    torch.cuda.synchronize()
+
+    elapsed_ms = start.elapsed_time(end)
+    ms_per_step = elapsed_ms / BENCH_ITERS
+    tok_per_s = batch_size * block_size / (ms_per_step / 1000)
 
     peak = torch.cuda.max_memory_allocated(device)
 
@@ -92,15 +119,18 @@ def check_memory(config_path: str, batch_size_override: int | None = None):
     print(f"Params:     {total_params:,}")
     print(f"Batch:      {batch_size} x {block_size}")
     print(f"Dtype:      {dtype_str}")
+    print(f"Sinkhorn checkpoint: {sk_ckpt}")
     print()
     print(f"Model load:       {mb(after_model):>8.1f} MB")
     print(f"+ Optimizer init: {mb(after_optimizer):>8.1f} MB")
-    print(f"+ Fwd + Bwd:      {mb(after_backward):>8.1f} MB")
-    print(f"+ Optimizer step: {mb(after_step):>8.1f} MB")
+    print(f"+ Warmup peak:    {mb(after_warmup):>8.1f} MB")
     print(f"Peak GPU memory:  {mb(peak):>8.1f} MB")
     print()
-    print(f"GPU total:        {torch.cuda.get_device_properties(0).total_mem / 1024**2:.0f} MB")
-    print(f"Headroom:         {(torch.cuda.get_device_properties(0).total_mem - peak) / 1024**2:.0f} MB")
+    print(f"Step time:        {ms_per_step:>8.1f} ms  ({BENCH_ITERS} iters)")
+    print(f"Throughput:       {tok_per_s:>8.0f} tok/s")
+    print()
+    print(f"GPU total:        {torch.cuda.get_device_properties(0).total_memory / 1024**2:.0f} MB")
+    print(f"Headroom:         {(torch.cuda.get_device_properties(0).total_memory - peak) / 1024**2:.0f} MB")
 
 
 if __name__ == "__main__":
@@ -109,6 +139,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("config", help="Path to config file")
     parser.add_argument("--batch_size", type=int, default=None, help="Override batch size")
+    parser.add_argument("--sinkhorn_checkpoint", action="store_true", default=None,
+                        help="Force sinkhorn gradient checkpointing on")
     args = parser.parse_args()
 
-    check_memory(args.config, args.batch_size)
+    check_memory(args.config, args.batch_size, args.sinkhorn_checkpoint)

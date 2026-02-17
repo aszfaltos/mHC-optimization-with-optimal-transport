@@ -12,6 +12,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.nn import Module
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from einops import rearrange, einsum
 from einops.layers.torch import Reduce
@@ -158,6 +159,7 @@ class HyperConnections(Module):
         mhc_residual_alpha=0.01,
         routing_granularity=None,
         routing_bottleneck_dim=None,
+        sinkhorn_checkpoint=False,
         **kwargs,  # absorb unused params (mhc, mhc_h_res_proj, ns_*, etc.)
     ):
         super().__init__()
@@ -184,6 +186,7 @@ class HyperConnections(Module):
 
         self.sinkhorn_iters = sinkhorn_iters
         self.sinkhorn_tau = sinkhorn_tau
+        self.sinkhorn_checkpoint = sinkhorn_checkpoint
 
         # H^res: static bias b^res + dynamic α·mat(x̃'·φ^res) (paper Eq. 7)
         H_res_init = torch.full((m, m), -8.0)
@@ -242,7 +245,10 @@ class HyperConnections(Module):
                 *bus_normed.shape[:-1], self.routing_m, self.routing_m
             )
         res_logits = self.alpha_res * raw + self.H_res_logits
-        S = sinkhorn_log(res_logits, self.sinkhorn_iters, self.sinkhorn_tau)
+        if self.sinkhorn_checkpoint and res_logits.requires_grad:
+            S = torch_checkpoint(sinkhorn_log, res_logits, self.sinkhorn_iters, self.sinkhorn_tau, use_reentrant=False)
+        else:
+            S = sinkhorn_log(res_logits, self.sinkhorn_iters, self.sinkhorn_tau)
 
         if self.mhc_residual_identity_mix:
             alpha = torch.sigmoid(self.H_res_alpha_logit)
@@ -346,7 +352,7 @@ class FullTransportRouting(Module):
     All couplings share a single conditioning bottleneck (norm → compress → code).
     """
 
-    def __init__(self, dim, m, d, n_streams=1, sinkhorn_iters=20, sinkhorn_tau=0.05):
+    def __init__(self, dim, m, d, n_streams=1, sinkhorn_iters=20, sinkhorn_tau=0.05, sinkhorn_checkpoint=False):
         super().__init__()
         self.m = m
         self.n = n_streams
@@ -354,6 +360,7 @@ class FullTransportRouting(Module):
         self.c_s = self.state_dim // m
         self.sinkhorn_iters = sinkhorn_iters
         self.sinkhorn_tau = sinkhorn_tau
+        self.sinkhorn_checkpoint = sinkhorn_checkpoint
 
         assert self.state_dim % m == 0, (
             f"m ({m}) must divide n_streams * dim ({self.state_dim})"
@@ -403,6 +410,8 @@ class FullTransportRouting(Module):
 
     def _coupling(self, code, alpha, to_logits, bias, rows, cols):
         logits = alpha * (code @ to_logits).view(*code.shape[:-1], rows, cols) + bias
+        if self.sinkhorn_checkpoint and logits.requires_grad:
+            return torch_checkpoint(sinkhorn_log, logits, self.sinkhorn_iters, self.sinkhorn_tau, use_reentrant=False)
         return sinkhorn_log(logits, self.sinkhorn_iters, self.sinkhorn_tau)
 
     def read(self, s_flat, code):

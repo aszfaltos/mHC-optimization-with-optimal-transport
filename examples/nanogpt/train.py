@@ -81,6 +81,7 @@ mhc_residual_alpha = 0.01
 routing_granularity = None
 routing_bottleneck_dim = None
 full_transport_routing = False
+sinkhorn_checkpoint = False
 
 # dtype: "float32", "bfloat16", "float16"
 dtype = "bfloat16"
@@ -344,6 +345,7 @@ def _write_config_effective(*, out_dir_path: Path) -> None:
         "routing_granularity",
         "routing_bottleneck_dim",
         "full_transport_routing",
+        "sinkhorn_checkpoint",
         # logging
         "wandb_log",
         "wandb_project",
@@ -523,6 +525,7 @@ model_config = GPTConfig(
     routing_granularity=routing_granularity,
     routing_bottleneck_dim=routing_bottleneck_dim,
     full_transport_routing=full_transport_routing,
+    sinkhorn_checkpoint=sinkhorn_checkpoint,
 )
 
 model = GPT(model_config)
@@ -731,6 +734,7 @@ try:
             "routing_granularity": routing_granularity,
             "routing_bottleneck_dim": routing_bottleneck_dim,
             "full_transport_routing": full_transport_routing,
+            "sinkhorn_checkpoint": sinkhorn_checkpoint,
             "dtype": dtype,
             "world_size": ddp_world_size,
             "tokens_per_iter": tokens_per_iter,
