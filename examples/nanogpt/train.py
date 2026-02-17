@@ -82,6 +82,7 @@ routing_granularity = None
 routing_bottleneck_dim = None
 full_transport_routing = False
 sinkhorn_checkpoint = False
+resume_from = None  # path to checkpoint dir or .pt file for resuming
 
 # dtype: "float32", "bfloat16", "float16"
 dtype = "bfloat16"
@@ -346,6 +347,7 @@ def _write_config_effective(*, out_dir_path: Path) -> None:
         "routing_bottleneck_dim",
         "full_transport_routing",
         "sinkhorn_checkpoint",
+        "resume_from",
         # logging
         "wandb_log",
         "wandb_project",
@@ -674,6 +676,33 @@ best_val_loss = 1e9
 last_eval_losses = None
 last_eval_iter = None
 
+# Resume from checkpoint
+_resume_wandb_id = None
+if resume_from is not None:
+    ckpt_path = resume_from
+    if os.path.isdir(ckpt_path):
+        for name in ("ckpt_final.pt", "ckpt.pt"):
+            candidate = os.path.join(ckpt_path, name)
+            if os.path.exists(candidate):
+                ckpt_path = candidate
+                break
+        else:
+            raise FileNotFoundError(f"No checkpoint found in {resume_from}")
+    _resume_ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    raw_model.load_state_dict(_resume_ckpt["model"])
+    if "optimizer" in _resume_ckpt:
+        optimizer.load_state_dict(_resume_ckpt["optimizer"])
+    iter_num = _resume_ckpt["iter_num"]
+    best_val_loss = _resume_ckpt["best_val_loss"]
+    if "rng_state" in _resume_ckpt:
+        torch.set_rng_state(_resume_ckpt["rng_state"])
+    if "cuda_rng_state" in _resume_ckpt and device_type == "cuda":
+        torch.cuda.set_rng_state(_resume_ckpt["cuda_rng_state"])
+    _resume_wandb_id = _resume_ckpt.get("wandb_run_id")
+    if master_process:
+        print(f"Resumed from {ckpt_path} at iter {iter_num}, best_val_loss={best_val_loss:.4f}")
+    del _resume_ckpt
+
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
 if master_process:
     print(f"Training on {device}, dtype={dtype}, DDP={ddp}")
@@ -711,40 +740,59 @@ run_error = None
 
 try:
     if wandb is not None:
-        wandb.init(
-        project=wandb_project,
-        name=wandb_run_name,
-        group=wandb_group,
-        job_type=wandb_job_type,
-        tags=wandb_tags,
-        config={
-            "dataset": dataset,
-            "n_layer": n_layer,
-            "n_head": n_head,
-            "n_embd": n_embd,
-            "batch_size": batch_size,
-            "block_size": block_size,
-            "learning_rate": learning_rate,
-            "max_iters": max_iters,
-            "hc_num_streams": hc_num_streams,
-            "hc_disable": hc_disable,
-            "mhc": mhc,
-            "sinkhorn_iters": sinkhorn_iters,
-            "sinkhorn_tau": sinkhorn_tau,
-            "routing_granularity": routing_granularity,
-            "routing_bottleneck_dim": routing_bottleneck_dim,
-            "full_transport_routing": full_transport_routing,
-            "sinkhorn_checkpoint": sinkhorn_checkpoint,
-            "dtype": dtype,
-            "world_size": ddp_world_size,
-            "tokens_per_iter": tokens_per_iter,
-            "wandb_log_layer_stats": wandb_log_layer_stats,
-            "wandb_log_layer_cosine": wandb_log_layer_cosine,
-            "total_params": total_params,
-            "routing_params": routing_params,
-            "routing_overhead_pct": routing_params / total_params * 100 if routing_params > 0 else 0,
-        },
+        wandb_init_kwargs = dict(
+            project=wandb_project,
+            name=wandb_run_name,
+            group=wandb_group,
+            job_type=wandb_job_type,
+            tags=wandb_tags,
+            config={
+                "dataset": dataset,
+                "n_layer": n_layer,
+                "n_head": n_head,
+                "n_embd": n_embd,
+                "batch_size": batch_size,
+                "block_size": block_size,
+                "learning_rate": learning_rate,
+                "max_iters": max_iters,
+                "hc_num_streams": hc_num_streams,
+                "hc_disable": hc_disable,
+                "mhc": mhc,
+                "sinkhorn_iters": sinkhorn_iters,
+                "sinkhorn_tau": sinkhorn_tau,
+                "routing_granularity": routing_granularity,
+                "routing_bottleneck_dim": routing_bottleneck_dim,
+                "full_transport_routing": full_transport_routing,
+                "sinkhorn_checkpoint": sinkhorn_checkpoint,
+                "resume_from": resume_from,
+                "dtype": dtype,
+                "world_size": ddp_world_size,
+                "tokens_per_iter": tokens_per_iter,
+                "wandb_log_layer_stats": wandb_log_layer_stats,
+                "wandb_log_layer_cosine": wandb_log_layer_cosine,
+                "total_params": total_params,
+                "routing_params": routing_params,
+                "routing_overhead_pct": routing_params / total_params * 100 if routing_params > 0 else 0,
+            },
         )
+        if _resume_wandb_id is not None:
+            wandb_init_kwargs["id"] = _resume_wandb_id
+            wandb_init_kwargs["resume"] = "must"
+        wandb.init(**wandb_init_kwargs)
+
+    def _make_checkpoint():
+        ckpt = {
+            "model": raw_model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "config": model_config.__dict__,
+            "iter_num": iter_num,
+            "best_val_loss": best_val_loss,
+            "rng_state": torch.get_rng_state(),
+            "wandb_run_id": wandb.run.id if wandb is not None else None,
+        }
+        if device_type == "cuda":
+            ckpt["cuda_rng_state"] = torch.cuda.get_rng_state()
+        return ckpt
 
     while iter_num <= max_iters:
         lr = get_lr(iter_num)
@@ -781,13 +829,7 @@ try:
             if losses["val"] < best_val_loss:
                 best_val_loss = losses["val"]
                 os.makedirs(out_dir, exist_ok=True)
-                checkpoint = {
-                    "model": raw_model.state_dict(),
-                    "config": model_config.__dict__,
-                    "iter_num": iter_num,
-                    "best_val_loss": best_val_loss,
-                }
-                torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
+                torch.save(_make_checkpoint(), os.path.join(out_dir, "ckpt.pt"))
 
         # periodic checkpoint for transport analysis
         if (
@@ -797,13 +839,7 @@ try:
             and master_process
         ):
             os.makedirs(out_dir, exist_ok=True)
-            checkpoint = {
-                "model": raw_model.state_dict(),
-                "config": model_config.__dict__,
-                "iter_num": iter_num,
-                "best_val_loss": best_val_loss,
-            }
-            torch.save(checkpoint, os.path.join(out_dir, f"ckpt_{iter_num}.pt"))
+            torch.save(_make_checkpoint(), os.path.join(out_dir, f"ckpt_{iter_num}.pt"))
 
         t0 = time.time()
 
@@ -880,13 +916,7 @@ try:
     # save final checkpoint
     if master_process:
         os.makedirs(out_dir, exist_ok=True)
-        checkpoint = {
-            "model": raw_model.state_dict(),
-            "config": model_config.__dict__,
-            "iter_num": iter_num,
-            "best_val_loss": best_val_loss,
-        }
-        torch.save(checkpoint, os.path.join(out_dir, "ckpt_final.pt"))
+        torch.save(_make_checkpoint(), os.path.join(out_dir, "ckpt_final.pt"))
 
     run_success = True
 except Exception:
