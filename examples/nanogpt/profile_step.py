@@ -1,11 +1,13 @@
-"""Estimate peak GPU memory and step time for a training config.
+"""Profile a full training step (fwd + bwd + optimizer) with torch.profiler.
 
-Runs a few warmup iterations then times a forward+backward+step cycle.
+Produces a Chrome-trace JSON and prints a table of the top CUDA/CPU ops
+sorted by total GPU time.
 
 Usage:
-    uv run python check_memory.py config/train_baseline_32M.py
-    uv run python check_memory.py config/train_L1_m16.py --batch_size=8
-    uv run python check_memory.py config/train_L1_m16.py --sinkhorn_checkpoint
+    uv run python profile_step.py config/train_baseline_32M.py
+    uv run python profile_step.py config/train_L1_m16.py --batch_size=8
+    uv run python profile_step.py config/train_L1_m16.py --sort=cpu_time_total
+    uv run python profile_step.py config/train_L1_m16.py --trace=trace_L1.json
 """
 
 import os
@@ -14,15 +16,22 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 import torch
+from torch.profiler import profile, ProfilerActivity, schedule
 
 from examples.nanogpt.model import GPT, GPTConfig
-from hyper_connections import HyperConnections
 
 WARMUP_ITERS = 3
-BENCH_ITERS = 10
+ACTIVE_ITERS = 3
 
 
-def check_memory(config_path: str, batch_size_override: int | None = None, sinkhorn_checkpoint: bool | None = None):
+def profile_step(
+    config_path: str,
+    batch_size_override: int | None = None,
+    sinkhorn_checkpoint: bool | None = None,
+    sort_by: str = "cuda_time_total",
+    trace_path: str | None = None,
+    top_n: int = 30,
+):
     # ---- load config via exec (same as train.py) ----
     cfg = {}
     exec(open(config_path).read(), cfg)
@@ -56,22 +65,15 @@ def check_memory(config_path: str, batch_size_override: int | None = None, sinkh
     )
 
     device = "cuda"
-    torch.cuda.reset_peak_memory_stats(device)
-    torch.cuda.empty_cache()
-
-    # ---- model ----
     model = GPT(model_config)
     model.to(device)
-    after_model = torch.cuda.max_memory_allocated(device)
 
-    # ---- optimizer (AdamW stores 2 extra fp32 copies per param) ----
     optimizer = model.configure_optimizers(
         weight_decay=cfg.get("weight_decay", 0.1),
         learning_rate=cfg.get("learning_rate", 6e-4),
         betas=(cfg.get("beta1", 0.9), cfg.get("beta2", 0.95)),
         device_type="cuda",
     )
-    after_optimizer = torch.cuda.max_memory_allocated(device)
 
     ctx = torch.amp.autocast(device_type="cuda", dtype=ptdtype)
 
@@ -83,54 +85,43 @@ def check_memory(config_path: str, batch_size_override: int | None = None, sinkh
             _, loss = model(x, y)
         loss.backward()
         optimizer.step()
-        return loss.item()
 
-    # ---- warmup (also triggers lazy optimizer state alloc) ----
+    # ---- warmup outside profiler (triggers lazy allocs, Triton compilation) ----
     for _ in range(WARMUP_ITERS):
         train_step()
-
-    after_warmup = torch.cuda.max_memory_allocated(device)
-
-    # ---- timed benchmark ----
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-
-    start.record()
-    for _ in range(BENCH_ITERS):
-        train_step()
-    end.record()
     torch.cuda.synchronize()
 
-    elapsed_ms = start.elapsed_time(end)
-    ms_per_step = elapsed_ms / BENCH_ITERS
-    tok_per_s = batch_size * block_size / (ms_per_step / 1000)
-
-    peak = torch.cuda.max_memory_allocated(device)
-
-    # ---- report ----
-    total_params = sum(p.numel() for p in model.parameters())
+    # ---- profile ----
     name = os.path.basename(config_path).replace("train_", "").replace(".py", "")
-
-    def mb(x):
-        return x / 1024**2
+    total_params = sum(p.numel() for p in model.parameters())
 
     print(f"Config:     {name}")
     print(f"Params:     {total_params:,}")
     print(f"Batch:      {batch_size} x {block_size}")
     print(f"Dtype:      {dtype_str}")
-    print(f"Sinkhorn checkpoint: {sk_ckpt}")
+    print(f"Profiling {ACTIVE_ITERS} steps...")
     print()
-    print(f"Model load:       {mb(after_model):>8.1f} MB")
-    print(f"+ Optimizer init: {mb(after_optimizer):>8.1f} MB")
-    print(f"+ Warmup peak:    {mb(after_warmup):>8.1f} MB")
-    print(f"Peak GPU memory:  {mb(peak):>8.1f} MB")
-    print()
-    print(f"Step time:        {ms_per_step:>8.1f} ms  ({BENCH_ITERS} iters)")
-    print(f"Throughput:       {tok_per_s:>8.0f} tok/s")
-    print()
-    print(f"GPU total:        {torch.cuda.get_device_properties(0).total_memory / 1024**2:.0f} MB")
-    print(f"Headroom:         {(torch.cuda.get_device_properties(0).total_memory - peak) / 1024**2:.0f} MB")
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=schedule(wait=0, warmup=1, active=ACTIVE_ITERS, repeat=1),
+        record_shapes=True,
+        with_stack=True,
+        profile_memory=True,
+    ) as prof:
+        for _ in range(1 + ACTIVE_ITERS):  # 1 warmup + active
+            train_step()
+            prof.step()
+
+    # ---- print top ops by GPU time ----
+    print(prof.key_averages().table(sort_by=sort_by, row_limit=top_n))
+
+    # ---- export Chrome trace ----
+    if trace_path is None:
+        trace_path = f"trace_{name}.json"
+    prof.export_chrome_trace(trace_path)
+    print(f"\nChrome trace saved to: {trace_path}")
+    print("Open in chrome://tracing or https://ui.perfetto.dev")
 
 
 if __name__ == "__main__":
@@ -141,6 +132,13 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=None, help="Override batch size")
     parser.add_argument("--sinkhorn_checkpoint", action="store_true", default=None,
                         help="Force sinkhorn gradient checkpointing on")
+    parser.add_argument("--sort", default="cuda_time_total",
+                        help="Sort column (default: cuda_time_total)")
+    parser.add_argument("--trace", default=None,
+                        help="Output trace JSON path (default: trace_<config>.json)")
+    parser.add_argument("--top", type=int, default=30,
+                        help="Number of top ops to show (default: 30)")
     args = parser.parse_args()
 
-    check_memory(args.config, args.batch_size, args.sinkhorn_checkpoint)
+    profile_step(args.config, args.batch_size, args.sinkhorn_checkpoint,
+                 args.sort, args.trace, args.top)

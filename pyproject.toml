@@ -32,6 +32,8 @@ dependencies = [
     "basedpyright>=1.21.0",
     "numpy>=1.26.0",
     "wandb>=0.16.0",
+    "matplotlib>=3.9.4",
+    "pandas>=2.3.3",
 ]
 
 [project.urls]
@@ -48,6 +50,11 @@ pythonpath = ["."]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.19.1",
+]
 
 [tool.rye]
 managed = true

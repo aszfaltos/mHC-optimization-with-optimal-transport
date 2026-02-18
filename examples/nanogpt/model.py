@@ -167,8 +167,8 @@ class GPTConfig:
         self.hc_num_streams = kwargs.pop("hc_num_streams", 1)
         self.hc_disable = kwargs.pop("hc_disable", False)
         self.mhc = kwargs.pop("mhc", False)
-        self.sinkhorn_iters = kwargs.pop("sinkhorn_iters", 10)
-        self.sinkhorn_tau = kwargs.pop("sinkhorn_tau", 0.05)
+        self.sinkhorn_iters = kwargs.pop("sinkhorn_iters", 20)
+        self.sinkhorn_tau = kwargs.pop("sinkhorn_tau", 1.0)
         self.mhc_residual_identity_mix = kwargs.pop("mhc_residual_identity_mix", False)
         self.mhc_residual_alpha = kwargs.pop("mhc_residual_alpha", 0.01)
         self.routing_granularity = kwargs.pop("routing_granularity", None)
@@ -188,15 +188,29 @@ class GPT(nn.Module):
 
         self.config = config
 
+        # Choose bus layout: "chunks" for FTR, "streams" for HC
+        if config.full_transport_routing and config.hc_num_streams > 1:
+            n = config.hc_num_streams
+            m = config.routing_granularity
+            c = n * config.n_embd // m
+            layout = "chunks"
+        else:
+            layout = "streams"
+            m, c = None, None
+
         init_hc, expand_stream, reduce_stream = (
             get_init_and_expand_reduce_stream_functions(
                 config.hc_num_streams,
                 disable=config.hc_disable,
+                layout=layout,
+                m=m,
+                c=c,
             )
         )
 
         self.expand_stream = expand_stream
         self.reduce_stream = reduce_stream
+        self._bus_layout = layout
 
         self.transformer = nn.ModuleDict(
             dict(
@@ -244,8 +258,18 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x = block(x)
 
+        # ln_f expects last dim = n_embd.
+        # "streams" layout (B,T,n,dim): dim == n_embd, normalizes each stream independently.
+        # "chunks" layout (B,T,m,c): reshape to (B,T,n,dim) so ln_f sees dim-sized last dim.
+        if self._bus_layout == "chunks":
+            n = self.config.hc_num_streams
+            x = x.reshape(*x.shape[:-2], n, self.config.n_embd)
         x = self.transformer.ln_f(x)
-        x = self.reduce_stream(x)
+        # Both layouts now (B,T,n,dim) — reduce sums over stream dim
+        if self._bus_layout == "chunks":
+            x = x.sum(dim=-2)  # (B,T,n,dim) → (B,T,dim)
+        else:
+            x = self.reduce_stream(x)
 
         logits = self.lm_head(x)
 

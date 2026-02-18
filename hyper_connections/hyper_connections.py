@@ -14,8 +14,7 @@ import torch.nn.functional as F
 from torch.nn import Module
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
-from einops import rearrange, einsum
-from einops.layers.torch import Reduce
+from einops import einsum
 
 """
 ein notation:
@@ -37,42 +36,61 @@ def default(v, d):
 
 # core: log-domain Sinkhorn (doubly stochastic projection)
 
-try:
-    from hyper_connections.triton_sinkhorn import triton_sinkhorn as _triton_sinkhorn
-    _HAS_TRITON_SINKHORN = True
-except ImportError:
-    _HAS_TRITON_SINKHORN = False
+from hyper_connections.triton_sinkhorn import triton_sinkhorn as _triton_sinkhorn
+from hyper_connections.triton_rmsnorm import triton_rmsnorm as _triton_rmsnorm
+from hyper_connections.triton_sinkhorn_route import (
+    triton_sinkhorn_route as _triton_sinkhorn_route,
+    triton_sinkhorn_route_fused as _triton_sinkhorn_route_fused,
+)
 
 
-def _sinkhorn_log_pytorch(logits, num_iters=10, tau=0.05):
-    """Pure-PyTorch log-domain Sinkhorn (fallback when Triton unavailable)."""
-    n = logits.shape[-1]
+def _sinkhorn_log_pytorch(logits, num_iters=20, tau=1.0):
+    """Pure-PyTorch log-domain Sinkhorn (CPU-only fallback for testing).
+
+    Uses separate row/col marginals so rectangular matrices converge properly.
+    Output is scaled by rows so row sums = 1 (suitable for routing matmuls).
+    """
+    rows, cols = logits.shape[-2], logits.shape[-1]
     Z = logits / tau
 
     u = torch.zeros(*logits.shape[:-1], device=Z.device, dtype=Z.dtype)
-    v = torch.zeros(*logits.shape[:-2], n, device=Z.device, dtype=Z.dtype)
+    v = torch.zeros(*logits.shape[:-2], cols, device=Z.device, dtype=Z.dtype)
 
-    log_marginal = -math.log(n)
+    log_row_marginal = -math.log(rows)
+    log_col_marginal = -math.log(cols)
 
     for _ in range(num_iters):
-        u = log_marginal - torch.logsumexp(Z + v.unsqueeze(-2), dim=-1)
-        v = log_marginal - torch.logsumexp(Z + u.unsqueeze(-1), dim=-2)
+        u = log_row_marginal - torch.logsumexp(Z + v.unsqueeze(-2), dim=-1)
+        v = log_col_marginal - torch.logsumexp(Z + u.unsqueeze(-1), dim=-2)
 
-    return torch.exp(Z + u.unsqueeze(-1) + v.unsqueeze(-2)) * n
+    return torch.exp(Z + u.unsqueeze(-1) + v.unsqueeze(-2)) * rows
 
 
-def sinkhorn_log(logits, num_iters=10, tau=0.05):
-    """Project logits onto the set of doubly stochastic matrices via Sinkhorn.
+def sinkhorn_log(logits, num_iters=20, tau=1.0, num_iters_bwd=None):
+    """Project logits onto doubly stochastic matrices via Sinkhorn.
 
-    Operates in log-space for numerical stability.  Accepts batched inputs
-    ``(..., r, c)`` and returns ``exp(...) * n`` so that row/col sums ≈ 1.
-
-    Uses a fused Triton kernel on CUDA when available, otherwise falls back
-    to the pure-PyTorch implementation.
+    Triton kernel on CUDA, pure-PyTorch on CPU.
     """
-    if _HAS_TRITON_SINKHORN and logits.is_cuda:
-        return _triton_sinkhorn(logits, num_iters, tau)
+    if logits.is_cuda:
+        return _triton_sinkhorn(logits, num_iters, tau, num_iters_bwd=num_iters_bwd)
     return _sinkhorn_log_pytorch(logits, num_iters, tau)
+
+
+def sinkhorn_route(logits, state, num_iters=20, tau=1.0, num_iters_bwd=None):
+    """Fused Sinkhorn projection + routing: ``Sinkhorn(logits) @ state``."""
+    if logits.is_cuda:
+        return _triton_sinkhorn_route(logits, state, num_iters, tau, num_iters_bwd=num_iters_bwd)
+    P = _sinkhorn_log_pytorch(logits, num_iters, tau)
+    return einsum(P, state, "... i j, ... j c -> ... i c")
+
+
+def sinkhorn_route_fused(raw_logits, alpha, bias, state, num_iters=20, tau=1.0, num_iters_bwd=None):
+    """Fused alpha*raw+bias → Sinkhorn → P@state."""
+    if raw_logits.is_cuda:
+        return _triton_sinkhorn_route_fused(raw_logits, alpha, bias, state, num_iters, tau, num_iters_bwd=num_iters_bwd)
+    logits = alpha * raw_logits + bias
+    P = _sinkhorn_log_pytorch(logits, num_iters, tau)
+    return einsum(P, state, "... i j, ... j c -> ... i c")
 
 
 # norms
@@ -83,30 +101,90 @@ class RMSNorm(Module):
         super().__init__()
         self.scale = dim**0.5
         self.gamma = nn.Parameter(torch.zeros(dim))
+        self._dim = dim
 
     def forward(self, x):
+        if x.is_cuda:
+            return _triton_rmsnorm(x, self.gamma, self._dim)
         return F.normalize(x, dim=-1) * self.scale * (self.gamma + 1)
 
 
 # stream expand/reduce
 
 
-def get_expand_reduce_stream_functions(num_streams, disable=False):
+class ExpandStreams(Module):
+    """Expand ``(B, ..., dim)`` → ``(B, ..., n, dim)`` via repeat (free view)."""
+
+    def __init__(self, num_streams):
+        super().__init__()
+        self.n = num_streams
+
+    def forward(self, x):
+        return x.unsqueeze(-2).expand(*x.shape[:-1], self.n, x.shape[-1])
+
+
+class ReduceStreams(Module):
+    """Reduce ``(B, ..., n, dim)`` → ``(B, ..., dim)`` via sum."""
+
+    def __init__(self, num_streams):
+        super().__init__()
+        self.n = num_streams
+
+    def forward(self, x):
+        return x.sum(dim=-2)
+
+
+class ExpandChunks(Module):
+    """Expand ``(B, ..., dim)`` → ``(B, ..., m, c)`` via reshape+repeat (for FTR)."""
+
+    def __init__(self, num_streams, m, c):
+        super().__init__()
+        self.n = num_streams
+        self.m = m
+        self.c = c
+
+    def forward(self, x):
+        # (B, ..., dim) → (B, ..., m, c) via repeat n times then reshape
+        if self.n == 1:
+            return x.reshape(*x.shape[:-1], self.m, self.c)
+        # n>1: (B, ..., dim) → (B, ..., n*dim) → (B, ..., m, c)
+        expanded = x.unsqueeze(-2).expand(*x.shape[:-1], self.n, x.shape[-1])
+        flat = expanded.reshape(*x.shape[:-1], self.n * x.shape[-1])
+        return flat.reshape(*x.shape[:-1], self.m, self.c)
+
+
+class ReduceChunks(Module):
+    """Reduce ``(B, ..., m, c)`` → ``(B, ..., dim)`` via reshape+sum (for FTR)."""
+
+    def __init__(self, num_streams, dim):
+        super().__init__()
+        self.n = num_streams
+        self.dim = dim
+
+    def forward(self, x):
+        if self.n == 1:
+            return x.reshape(*x.shape[:-2], self.dim)
+        # n>1: (B, ..., m, c) → (B, ..., n, dim) → sum → (B, ..., dim)
+        return x.reshape(*x.shape[:-2], self.n, self.dim).sum(dim=-2)
+
+
+def get_expand_reduce_stream_functions(num_streams, disable=False, layout="streams", m=None, c=None):
     if num_streams == 1 or disable:
         return (nn.Identity(), nn.Identity())
 
-    expand_fn = Reduce(
-        pattern="b ... -> (b s) ...", reduction="repeat", s=num_streams
-    )
-    reduce_fn = Reduce(
-        pattern="(b s) ... -> b ...", reduction="sum", s=num_streams
-    )
+    if layout == "chunks":
+        assert m is not None and c is not None
+        dim = num_streams * c * m // (num_streams)  # c * m / n = dim when m*c = n*dim
+        # Actually: n*dim = m*c, so dim = m*c/n
+        dim = m * c // num_streams
+        return ExpandChunks(num_streams, m, c), ReduceChunks(num_streams, dim)
 
-    return expand_fn, reduce_fn
+    # Default: "streams" layout → (B, ..., n, dim)
+    return ExpandStreams(num_streams), ReduceStreams(num_streams)
 
 
 def get_init_and_expand_reduce_stream_functions(
-    num_streams, disable=None, **kwargs
+    num_streams, disable=None, layout="streams", m=None, c=None, **kwargs
 ):
     """Return ``(init_hc, expand_stream, reduce_stream)`` factory triple.
 
@@ -119,7 +197,7 @@ def get_init_and_expand_reduce_stream_functions(
 
     init_hyper_conn_fn = partial(hyper_conn_klass, num_streams)
     expand_reduce_fns = get_expand_reduce_stream_functions(
-        num_streams, disable=disable
+        num_streams, disable=disable, layout=layout, m=m, c=c
     )
 
     return (init_hyper_conn_fn, *expand_reduce_fns)
@@ -169,8 +247,9 @@ class HyperConnections(Module):
         branch=None,
         layer_index=None,
         dropout=0.0,
-        sinkhorn_iters=10,
-        sinkhorn_tau=0.05,
+        sinkhorn_iters=20,
+        sinkhorn_iters_bwd=None,
+        sinkhorn_tau=1.0,
         mhc_residual_identity_mix=False,
         mhc_residual_alpha=0.01,
         routing_granularity=None,
@@ -183,6 +262,7 @@ class HyperConnections(Module):
 
         assert num_residual_streams > 0
         self.num_residual_streams = num_residual_streams
+        self._single_stream = num_residual_streams == 1
         init_residual_index = (
             default(layer_index, 0) % num_residual_streams
         )
@@ -201,6 +281,7 @@ class HyperConnections(Module):
         self.mhc_norm = RMSNorm(total_bus_dim)
 
         self.sinkhorn_iters = sinkhorn_iters
+        self.sinkhorn_iters_bwd = sinkhorn_iters_bwd
         self.sinkhorn_tau = sinkhorn_tau
         self.sinkhorn_checkpoint = sinkhorn_checkpoint
 
@@ -241,62 +322,111 @@ class HyperConnections(Module):
         self.dropout = nn.Dropout(dropout)
 
     def width_connection(self, residuals):
+        # residuals: (B, T, n, dim) for n>1, or (B, T, dim) for n=1 (Identity expand)
         streams = self.num_residual_streams
 
-        # Split out streams: (B*n, T, dim) → (B, T, n, dim)
-        residuals = rearrange(residuals, "(b s) ... d -> b ... s d", s=streams)
+        # For n=1, add stream dim so all paths see (B, T, n, dim)
+        if self._single_stream and residuals.shape[-1] != streams:
+            residuals = residuals.unsqueeze(-2)  # (B,T,dim) → (B,T,1,dim) — free view
 
         # Flatten bus and normalize for dynamic projections (paper Eq. 7)
-        bus_flat = rearrange(residuals, "b ... s d -> b ... (s d)")
+        bus_flat = residuals.reshape(*residuals.shape[:-2], streams * residuals.shape[-1])
         bus_normed = self.mhc_norm(bus_flat)
 
-        # Dynamic H^res: α·mat(x̃'·φ^res) + b^res → Sinkhorn (paper Eq. 7-8)
+        # --- Pre-cast all routing params to activation dtype once ---
+        # Prevents autocast from triggering aten::copy_ per-matmul per-layer.
+        dtype = residuals.dtype
         if self.routing_bottleneck:
-            code = bus_normed @ self.compress_res
-            raw = (code @ self.to_logits_res).view(
-                *bus_normed.shape[:-1], self.routing_m, self.routing_m
-            )
+            _compress_res = self.compress_res.to(dtype)
+            _to_logits_res = self.to_logits_res.to(dtype)
         else:
-            raw = (bus_normed @ self.phi_res).view(
-                *bus_normed.shape[:-1], self.routing_m, self.routing_m
-            )
-        res_logits = self.alpha_res * raw + self.H_res_logits
-        if self.sinkhorn_checkpoint and res_logits.requires_grad:
-            S = torch_checkpoint(sinkhorn_log, res_logits, self.sinkhorn_iters, self.sinkhorn_tau, use_reentrant=False)
+            _phi_res = self.phi_res.to(dtype)
+        if not self._single_stream:
+            _phi_pre = self.phi_pre.to(dtype)
+            _phi_post = self.phi_post.to(dtype)
+            _alpha_pre = self.alpha_pre.to(dtype)
+            _H_pre_logits = self.H_pre_logits.to(dtype)
+            _alpha_post = self.alpha_post.to(dtype)
+            _H_post_logits = self.H_post_logits.to(dtype)
+
+        # --- 1A + 1D: Batched φ projections ---
+        m = self.routing_m
+        if self.routing_bottleneck:
+            if self._single_stream:
+                # 1D: n=1, skip phi_pre entirely
+                code = bus_normed @ _compress_res
+                res_raw = code @ _to_logits_res
+            else:
+                # 1A: Batch compress_res + phi_pre into one matmul
+                both = bus_normed @ torch.cat([_compress_res, _phi_pre], dim=-1)
+                code, pre_raw = both.split([_compress_res.shape[-1], streams], dim=-1)
+                res_raw = code @ _to_logits_res
         else:
-            S = sinkhorn_log(res_logits, self.sinkhorn_iters, self.sinkhorn_tau)
+            if self._single_stream:
+                # 1D: n=1, skip phi_pre entirely
+                res_raw = bus_normed @ _phi_res
+            else:
+                # 1A: Batch phi_res + phi_pre into one matmul
+                both = bus_normed @ torch.cat([_phi_res, _phi_pre], dim=-1)
+                res_raw, pre_raw = both.split([m * m, streams], dim=-1)
 
-        if self.mhc_residual_identity_mix:
-            alpha = torch.sigmoid(self.H_res_alpha_logit)
-            I = torch.eye(self.routing_m, device=S.device, dtype=S.dtype)
-            H_res = (1 - alpha) * I + alpha * S
-        else:
-            H_res = S
-
-        # Dynamic H^pre: softmax(α·(x̃'·φ^pre) + b^pre) (paper Eq. 7-8)
-        H_pre = F.softmax(
-            self.alpha_pre * (bus_normed @ self.phi_pre) + self.H_pre_logits, dim=-1
-        )
-
-        # Dynamic H^post: softmax(α·(x̃'·φ^post) + b^post) (paper Eq. 7-8)
-        H_post = F.softmax(
-            self.alpha_post * (bus_normed @ self.phi_post) + self.H_post_logits,
-            dim=-1,
-        )
+        res_raw = res_raw.view(*bus_normed.shape[:-1], m, m)
 
         # Fine-grained routing: reshape bus to (m, c) before H^res, back to (n, dim) after.
         orig_shape = residuals.shape  # (..., n, dim)
         reshaped = residuals.reshape(
             *orig_shape[:-2], self.routing_m, self.routing_c
         )
-        mixed = einsum(H_res, reshaped, "... s t, ... s c -> ... t c")
+
+        # Use fused sinkhorn_route when we don't need intermediate S
+        _need_S = self.mhc_residual_identity_mix or getattr(self, "collect_stats", False)
+        if _need_S:
+            # Unfused path: need access to the doubly stochastic matrix
+            _alpha_res = self.alpha_res.to(dtype)
+            _H_res_logits = self.H_res_logits.to(dtype)
+            res_logits = _alpha_res * res_raw + _H_res_logits
+            if self.sinkhorn_checkpoint and res_logits.requires_grad:
+                S = torch_checkpoint(sinkhorn_log, res_logits, self.sinkhorn_iters, self.sinkhorn_tau, self.sinkhorn_iters_bwd, use_reentrant=False)
+            else:
+                S = sinkhorn_log(res_logits, self.sinkhorn_iters, self.sinkhorn_tau, self.sinkhorn_iters_bwd)
+
+            if self.mhc_residual_identity_mix:
+                alpha = torch.sigmoid(self.H_res_alpha_logit)
+                I = torch.eye(self.routing_m, device=S.device, dtype=S.dtype)
+                H_res = (1 - alpha) * I + alpha * S
+            else:
+                H_res = S
+
+            mixed = einsum(H_res, reshaped, "... s t, ... s c -> ... t c")
+        else:
+            # 2A: Fused alpha*raw+bias → Sinkhorn → P@state in one kernel
+            mixed = sinkhorn_route_fused(
+                res_raw, self.alpha_res, self.H_res_logits, reshaped,
+                self.sinkhorn_iters, self.sinkhorn_tau, self.sinkhorn_iters_bwd,
+            )
+
         residuals_mixed = mixed.reshape(orig_shape)
 
-        # Apply H^pre: weighted sum of streams → branch input
-        branch_input = einsum(H_pre, residuals, "... s, ... s d -> ... d")
+        # --- 1D: Short-circuit H^pre/H^post for n=1 ---
+        if self._single_stream:
+            # softmax([x]) = [1.0] always; einsum is identity squeeze
+            branch_input = residuals[..., 0, :]
+            H_post = None
+        else:
+            # Dynamic H^pre: softmax(α·(x̃'·φ^pre) + b^pre) (paper Eq. 7-8)
+            H_pre = F.softmax(_alpha_pre * pre_raw + _H_pre_logits, dim=-1)
+            branch_input = einsum(H_pre, residuals, "... s, ... s d -> ... d")
 
-        # Stats collection
-        if getattr(self, "collect_stats", False):
+            # --- 1B: H^post from routed bus state (not stale original) ---
+            routed_flat = residuals_mixed.reshape(*residuals_mixed.shape[:-2], streams * residuals_mixed.shape[-1])
+            routed_normed = self.mhc_norm(routed_flat)
+            H_post = F.softmax(
+                _alpha_post * (routed_normed @ _phi_post) + _H_post_logits,
+                dim=-1,
+            )
+
+        # Stats collection (only on unfused path where H_res is available)
+        if getattr(self, "collect_stats", False) and not self._single_stream:
             with torch.no_grad():
                 H_res_clamped = H_res.clamp(min=1e-8)
                 stats = dict(
@@ -313,18 +443,20 @@ class HyperConnections(Module):
                     stats["h_res_alpha"] = torch.sigmoid(self.H_res_alpha_logit)
                 self.last_stats = {k: v.detach() for k, v in stats.items()}
 
-        residuals_out = rearrange(residuals_mixed, "b ... s d -> (b s) ... d")
-
         return (
             branch_input,
-            residuals_out,
+            residuals_mixed,  # (B, T, n, dim) — no copy needed
             dict(beta=H_post, residuals_mixed=residuals_mixed),
         )
 
     def depth_connection(self, branch_output, residuals, *, beta, residuals_mixed):
-        branch_to_streams = einsum(branch_output, beta, "... d, ... s -> ... s d")
-        output = residuals_mixed + branch_to_streams
-        output = rearrange(output, "b ... s d -> (b s) ... d")
+        # Returns (B, T, n, dim) for n>1, or (B, T, dim) for n=1
+        if self._single_stream:
+            # 1D: n=1, H_post=[1.0], just add directly (no stream dim in output)
+            output = residuals_mixed.squeeze(-2) + branch_output
+        else:
+            branch_to_streams = einsum(branch_output, beta, "... d, ... s -> ... s d")
+            output = residuals_mixed + branch_to_streams
         return self.dropout(output)
 
     def forward(self, residuals, *branch_args, **branch_kwargs):
@@ -341,10 +473,10 @@ class HyperConnections(Module):
         return add_residual_fn(branch_output)
 
 
-HyperConnections.get_expand_reduce_stream_functions = staticmethod(
+HyperConnections.get_expand_reduce_stream_functions = staticmethod(  # type: ignore[attr-defined]
     get_expand_reduce_stream_functions
 )
-HyperConnections.get_init_and_expand_reduce_stream_functions = staticmethod(
+HyperConnections.get_init_and_expand_reduce_stream_functions = staticmethod(  # type: ignore[attr-defined]
     get_init_and_expand_reduce_stream_functions
 )
 
@@ -368,13 +500,14 @@ class FullTransportRouting(Module):
     All couplings share a single conditioning bottleneck (norm → compress → code).
     """
 
-    def __init__(self, dim, m, d, n_streams=1, sinkhorn_iters=20, sinkhorn_tau=0.05, sinkhorn_checkpoint=False):
+    def __init__(self, dim, m, d, n_streams=1, sinkhorn_iters=20, sinkhorn_iters_bwd=None, sinkhorn_tau=1.0, sinkhorn_checkpoint=False):
         super().__init__()
         self.m = m
         self.n = n_streams
         self.state_dim = n_streams * dim
         self.c_s = self.state_dim // m
         self.sinkhorn_iters = sinkhorn_iters
+        self.sinkhorn_iters_bwd = sinkhorn_iters_bwd
         self.sinkhorn_tau = sinkhorn_tau
         self.sinkhorn_checkpoint = sinkhorn_checkpoint
 
@@ -427,57 +560,126 @@ class FullTransportRouting(Module):
     def _coupling(self, code, alpha, to_logits, bias, rows, cols):
         logits = alpha * (code @ to_logits).view(*code.shape[:-1], rows, cols) + bias
         if self.sinkhorn_checkpoint and logits.requires_grad:
-            return torch_checkpoint(sinkhorn_log, logits, self.sinkhorn_iters, self.sinkhorn_tau, use_reentrant=False)
-        return sinkhorn_log(logits, self.sinkhorn_iters, self.sinkhorn_tau)
+            return torch_checkpoint(sinkhorn_log, logits, self.sinkhorn_iters, self.sinkhorn_tau, self.sinkhorn_iters_bwd, use_reentrant=False)
+        return sinkhorn_log(logits, self.sinkhorn_iters, self.sinkhorn_tau, self.sinkhorn_iters_bwd)
 
-    def read(self, s_flat, code):
+    def _coupling_route(self, code, alpha, to_logits, bias, state, rows, cols):
+        """Fused coupling + routing: computes Sinkhorn(alpha*raw+bias) @ state."""
+        raw = (code @ to_logits).view(*code.shape[:-1], rows, cols)
+        return sinkhorn_route_fused(raw, alpha, bias, state, self.sinkhorn_iters, self.sinkhorn_tau, self.sinkhorn_iters_bwd)
+
+    def read(self, s_flat, code, alpha_pre, to_logits_pre, H_pre_logits, need_coupling=False):
         """Assemble layer input from state via k×m coupling."""
-        H_pre = self._coupling(
-            code, self.alpha_pre, self.to_logits_pre, self.H_pre_logits, self.k, self.m
-        )
-        # (k, m) @ (m, c_s) → (k, c_s), reshape to (k*c_s) = dim
-        layer_in = einsum(H_pre, s_flat, "... i j, ... j c -> ... i c")
-        return layer_in.reshape(*s_flat.shape[:-2], -1), H_pre
-
-    def write(self, s_flat, layer_output, code):
-        """Align state, add output, rearrange for next layer."""
-        H_align = self._coupling(
-            code, self.alpha_align, self.to_logits_align, self.H_align_logits,
-            self.m, self.m,
-        )
-        H_next = self._coupling(
-            code, self.alpha_next, self.to_logits_next, self.H_next_logits,
-            self.m, self.m,
-        )
-
-        s_aligned = einsum(H_align, s_flat, "... i j, ... j c -> ... i c")
-
-        H_post = None
-        if self.needs_hpost:
-            H_post = self._coupling(
-                code, self.alpha_post, self.to_logits_post, self.H_post_logits,
-                self.m, self.k,
+        if need_coupling:
+            H_pre = self._coupling(
+                code, alpha_pre, to_logits_pre, H_pre_logits, self.k, self.m
             )
+            layer_in = einsum(H_pre, s_flat, "... i j, ... j c -> ... i c")
+            return layer_in.reshape(*s_flat.shape[:-2], -1), H_pre
+
+        # Fused path: Sinkhorn + routing in one kernel
+        layer_in = self._coupling_route(
+            code, alpha_pre, to_logits_pre, H_pre_logits,
+            s_flat, self.k, self.m,
+        )
+        return layer_in.reshape(*s_flat.shape[:-2], -1), None
+
+    def write(self, s_flat, layer_output, code,
+              alpha_align, to_logits_align, H_align_logits,
+              alpha_next, to_logits_next, H_next_logits,
+              alpha_post, to_logits_post, H_post_logits,
+              need_coupling=False):
+        """Align state, add output, rearrange for next layer."""
+        if need_coupling:
+            # Unfused path: need H matrices for stats
+            H_align = self._coupling(
+                code, alpha_align, to_logits_align, H_align_logits,
+                self.m, self.m,
+            )
+            H_next = self._coupling(
+                code, alpha_next, to_logits_next, H_next_logits,
+                self.m, self.m,
+            )
+            s_aligned = einsum(H_align, s_flat, "... i j, ... j c -> ... i c")
+
+            H_post = None
+            if self.needs_hpost:
+                H_post = self._coupling(
+                    code, alpha_post, to_logits_post, H_post_logits,
+                    self.m, self.k,
+                )
+                out_flat = layer_output.reshape(*layer_output.shape[:-1], self.k, -1)
+                s_updated = s_aligned + einsum(H_post, out_flat, "... i j, ... j c -> ... i c")
+            else:
+                out_flat = layer_output.reshape(*s_flat.shape[:-2], self.m, self.c_s)
+                s_updated = s_aligned + out_flat
+
+            s_next = einsum(H_next, s_updated, "... i j, ... j c -> ... i c")
+            return s_next, H_align, H_next, H_post
+
+        # Fused path: Sinkhorn + routing in one kernel per coupling
+        s_aligned = self._coupling_route(
+            code, alpha_align, to_logits_align, H_align_logits,
+            s_flat, self.m, self.m,
+        )
+
+        if self.needs_hpost:
             out_flat = layer_output.reshape(*layer_output.shape[:-1], self.k, -1)
-            s_updated = s_aligned + einsum(H_post, out_flat, "... i j, ... j c -> ... i c")
+            s_updated = s_aligned + self._coupling_route(
+                code, alpha_post, to_logits_post, H_post_logits,
+                out_flat, self.m, self.k,
+            )
         else:
             out_flat = layer_output.reshape(*s_flat.shape[:-2], self.m, self.c_s)
             s_updated = s_aligned + out_flat
 
-        s_next = einsum(H_next, s_updated, "... i j, ... j c -> ... i c")
-        return s_next, H_align, H_next, H_post
+        s_next = self._coupling_route(
+            code, alpha_next, to_logits_next, H_next_logits,
+            s_updated, self.m, self.m,
+        )
+        return s_next, None, None, None
 
     def forward(self, s, layer_fn):
-        """Full transport cycle: read → compute → write."""
-        s_flat = s.reshape(*s.shape[:-1], self.m, self.c_s)
-        s_norm = self.norm(s.reshape(*s.shape[:-1], self.state_dim))
-        code = s_norm @ self.compress
+        """Full transport cycle: read → compute → write.
 
-        layer_input, H_pre = self.read(s_flat, code)
+        Accepts either ``(B, T, m, c)`` (chunks layout) or ``(B, T, state_dim)``
+        (flat layout).  Both reshape to ``(m, c)`` internally as free views.
+        """
+        if s.ndim >= 3 and s.shape[-2] == self.m and s.shape[-1] == self.c_s:
+            s_flat = s  # already (B, T, m, c) — no reshape needed
+        else:
+            s_flat = s.reshape(*s.shape[:-1], self.m, self.c_s)
+        s_norm = self.norm(s_flat.reshape(*s_flat.shape[:-2], self.state_dim))
+
+        # Pre-cast matmul weights to activation dtype once (bf16 under autocast).
+        # Alpha scalars and H_*_logits biases stay fp32 — the fused kernel casts internally.
+        dtype = s.dtype
+        _compress = self.compress.to(dtype)
+        _to_logits_pre = self.to_logits_pre.to(dtype)
+        _to_logits_align = self.to_logits_align.to(dtype)
+        _to_logits_next = self.to_logits_next.to(dtype)
+        if self.needs_hpost:
+            _to_logits_post = self.to_logits_post.to(dtype)
+
+        code = s_norm @ _compress
+
+        _need_stats = getattr(self, "collect_stats", False)
+        layer_input, H_pre = self.read(
+            s_flat, code, self.alpha_pre, _to_logits_pre, self.H_pre_logits,
+            need_coupling=_need_stats,
+        )
         layer_output = layer_fn(layer_input)
-        s_next, H_align, H_next, H_post = self.write(s_flat, layer_output, code)
+        s_next, H_align, H_next, H_post = self.write(
+            s_flat, layer_output, code,
+            self.alpha_align, _to_logits_align, self.H_align_logits,
+            self.alpha_next, _to_logits_next, self.H_next_logits,
+            self.alpha_post if self.needs_hpost else None,
+            _to_logits_post if self.needs_hpost else None,
+            self.H_post_logits if self.needs_hpost else None,
+            need_coupling=_need_stats,
+        )
 
-        if getattr(self, "collect_stats", False):
+        if _need_stats:
             with torch.no_grad():
                 def _coupling_stats(H, prefix):
                     H_c = H.clamp(min=1e-8)
@@ -501,4 +703,6 @@ class FullTransportRouting(Module):
                     stats["alpha_post"] = self.alpha_post.detach()
                 self.last_stats = {k: v.detach() for k, v in stats.items()}
 
+        if s_next.shape == s.shape:
+            return s_next
         return s_next.reshape_as(s)

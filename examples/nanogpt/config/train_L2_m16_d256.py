@@ -21,9 +21,9 @@ dropout = 0.0
 bias = False
 
 # training (1B tokens on 3090 24GB)
-batch_size = 16
-gradient_accumulation_steps = 8
-max_iters = 5000
+batch_size = 64
+gradient_accumulation_steps = 2
+max_iters = 30000
 eval_interval = 500
 log_interval = 10
 eval_iters = 100
@@ -50,7 +50,7 @@ hc_num_fracs = 1
 hc_disable = False
 mhc = True
 sinkhorn_iters = 20
-sinkhorn_tau = 0.05
+sinkhorn_tau = 1.0
 mhc_h_res_proj = "sinkhorn"
 mhc_residual_identity_mix = False
 mhc_residual_alpha = 0.01

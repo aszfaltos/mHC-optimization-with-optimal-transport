@@ -68,21 +68,21 @@ def test_mhc_forward_shapes():
 
     streams, dim, batch, seq = 4, 64, 2, 8
     hc = HyperConnections(num_residual_streams=streams, dim=dim, mhc=True)
-    x = torch.randn(batch * streams, seq, dim)
+    x = torch.randn(batch, seq, streams, dim)
 
     branch_input, add_residual = hc(x)
     assert branch_input.shape == (batch, seq, dim)
 
     branch_output = torch.randn(batch, seq, dim)
     out = add_residual(branch_output)
-    assert out.shape == (batch * streams, seq, dim)
+    assert out.shape == (batch, seq, streams, dim)
 
 
 def test_mhc_gradients_flow():
     from hyper_connections.hyper_connections import HyperConnections
 
     hc = HyperConnections(num_residual_streams=4, dim=64, mhc=True)
-    x = torch.randn(8, 8, 64, requires_grad=True)
+    x = torch.randn(2, 8, 4, 64, requires_grad=True)
 
     branch_input, add_residual = hc(x)
     out = add_residual(branch_input)
@@ -140,7 +140,7 @@ def test_mhc_identity_mix_gradients_flow():
     hc = HyperConnections(
         num_residual_streams=4, dim=64, mhc=True, mhc_residual_identity_mix=True
     )
-    x = torch.randn(8, 8, 64, requires_grad=True)
+    x = torch.randn(2, 8, 4, 64, requires_grad=True)
 
     branch_input, add_residual = hc(x)
     out = add_residual(branch_input)
@@ -163,14 +163,14 @@ def test_mhc_identity_mix_forward_shapes():
         mhc=True,
         mhc_residual_identity_mix=True,
     )
-    x = torch.randn(batch * streams, seq, dim)
+    x = torch.randn(batch, seq, streams, dim)
 
     branch_input, add_residual = hc(x)
     assert branch_input.shape == (batch, seq, dim)
 
     branch_output = torch.randn(batch, seq, dim)
     out = add_residual(branch_output)
-    assert out.shape == (batch * streams, seq, dim)
+    assert out.shape == (batch, seq, streams, dim)
 
 
 # --------------------------------------------------------------------------- #
@@ -219,14 +219,14 @@ def test_fine_grained_forward_shapes():
     hc = HyperConnections(
         num_residual_streams=streams, dim=dim, mhc=True, routing_granularity=16
     )
-    x = torch.randn(batch * streams, seq, dim)
+    x = torch.randn(batch, seq, streams, dim)
 
     branch_input, add_residual = hc(x)
     assert branch_input.shape == (batch, seq, dim)
 
     branch_output = torch.randn(batch, seq, dim)
     out = add_residual(branch_output)
-    assert out.shape == (batch * streams, seq, dim)
+    assert out.shape == (batch, seq, streams, dim)
 
 
 def test_fine_grained_gradients_flow():
@@ -236,7 +236,7 @@ def test_fine_grained_gradients_flow():
     hc = HyperConnections(
         num_residual_streams=4, dim=64, mhc=True, routing_granularity=16
     )
-    x = torch.randn(8, 8, 64, requires_grad=True)
+    x = torch.randn(2, 8, 4, 64, requires_grad=True)
 
     branch_input, add_residual = hc(x)
     out = add_residual(branch_input)
@@ -255,7 +255,7 @@ def test_fine_grained_default_matches_original():
 
     torch.manual_seed(42)
     streams, dim, batch, seq = 4, 64, 2, 8
-    x = torch.randn(batch * streams, seq, dim)
+    x = torch.randn(batch, seq, streams, dim)
 
     hc_orig = HyperConnections(num_residual_streams=streams, dim=dim, mhc=True)
     hc_default = HyperConnections(
@@ -285,7 +285,7 @@ def test_fine_grained_m_equals_n_matches_original():
 
     torch.manual_seed(42)
     streams, dim, batch, seq = 4, 64, 2, 8
-    x = torch.randn(batch * streams, seq, dim)
+    x = torch.randn(batch, seq, streams, dim)
 
     hc_orig = HyperConnections(num_residual_streams=streams, dim=dim, mhc=True)
     hc_m4 = HyperConnections(
@@ -383,7 +383,7 @@ def test_fine_grained_identity_mix():
     )
 
     # Forward pass should work
-    x = torch.randn(8, 8, 64, requires_grad=True)
+    x = torch.randn(2, 8, 4, 64, requires_grad=True)
     branch_input, add_residual = hc(x)
     out = add_residual(branch_input)
     out.sum().backward()
@@ -398,7 +398,7 @@ def test_fine_grained_stats_collection():
         num_residual_streams=4, dim=64, mhc=True, routing_granularity=16
     )
     hc.collect_stats = True
-    x = torch.randn(8, 8, 64)
+    x = torch.randn(2, 8, 4, 64)
 
     branch_input, add_residual = hc(x)
     add_residual(branch_input)
@@ -490,14 +490,14 @@ def test_bottleneck_with_multistream():
         num_residual_streams=streams, dim=dim, mhc=True,
         routing_granularity=16, routing_bottleneck_dim=16,
     )
-    x = torch.randn(batch * streams, seq, dim)
+    x = torch.randn(batch, seq, streams, dim)
 
     branch_input, add_residual = hc(x)
     assert branch_input.shape == (batch, seq, dim)
 
     branch_output = torch.randn(batch, seq, dim)
     out = add_residual(branch_output)
-    assert out.shape == (batch * streams, seq, dim)
+    assert out.shape == (batch, seq, streams, dim)
 
 
 # --------------------------------------------------------------------------- #

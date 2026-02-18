@@ -74,8 +74,8 @@ data_dir = None
 hc_num_streams = 1
 hc_disable = True
 mhc = False
-sinkhorn_iters = 10
-sinkhorn_tau = 0.05
+sinkhorn_iters = 20
+sinkhorn_tau = 1.0
 mhc_residual_identity_mix = False
 mhc_residual_alpha = 0.01
 routing_granularity = None
@@ -576,8 +576,13 @@ def get_lr(it):
 
 
 def collect_hc_layer_stats():
-    layer_count = len(raw_model.transformer.h) * 2
-    layer_stats = {}
+    """Collect per-layer routing stats from HC/FTR modules.
+
+    Returns a list of dicts, each with 'block', 'type' ('attn'/'mlp'),
+    and metric key/value pairs.
+    """
+    _types = ("attn", "mlp")
+    rows = []
     for block_idx, block in enumerate(raw_model.transformer.h):
         if block.use_ftr:
             modules = (block.ftr_attn, block.ftr_mlp)
@@ -586,28 +591,32 @@ def collect_hc_layer_stats():
         for sub_idx, mod in enumerate(modules):
             if not hasattr(mod, "last_stats"):
                 continue
-            layer_index = block_idx * 2 + sub_idx
+            row = {"block": block_idx, "type": _types[sub_idx]}
             for key, value in mod.last_stats.items():
-                layer_stats.setdefault(key, [None] * layer_count)
-                layer_stats[key][layer_index] = value.item()
-    return layer_stats
+                row[key] = value.item()
+            rows.append(row)
+    return rows
 
 
-def build_layer_table(layer_stats):
-    if not layer_stats:
+def build_layer_table(layer_rows, model_name, run_seed):
+    """Build a wandb Table with model/seed/block/type columns for easy filtering.
+
+    Args:
+        layer_rows: list of dicts from collect_hc_layer_stats()
+        model_name: experiment name (e.g. "L1_m16")
+        run_seed: random seed for this run
+    """
+    if not layer_rows:
         return None
-    keys = sorted(layer_stats.keys())
-    layer_count = max(len(v) for v in layer_stats.values())
-    table = wandb.Table(columns=["layer"] + keys)
-    for i in range(layer_count):
-        row_vals = []
-        for key in keys:
-            values = layer_stats[key]
-            val = values[i] if i < len(values) else None
-            row_vals.append(val)
-        if all(v is None for v in row_vals):
-            continue
-        table.add_data(i, *row_vals)
+    # Gather all metric keys across rows
+    metric_keys = sorted(
+        {k for row in layer_rows for k in row if k not in ("block", "type")}
+    )
+    columns = ["model", "seed", "block", "type"] + metric_keys
+    table = wandb.Table(columns=columns)
+    for row in layer_rows:
+        vals = [row.get(k) for k in metric_keys]
+        table.add_data(model_name, run_seed, row["block"], row["type"], *vals)
     return table
 
 
@@ -817,13 +826,17 @@ try:
                 }
                 wandb.log(eval_log, step=iter_num)
                 if wandb_log_layer_cosine and layer_cosine is not None:
-                    layer_table = wandb.Table(columns=["layer", "cosine"])
+                    cosine_table = wandb.Table(
+                        columns=["model", "seed", "block", "cosine"]
+                    )
                     for idx, value in enumerate(layer_cosine):
-                        layer_table.add_data(idx, value)
-                    wandb.log({"hc/layer_cosine": layer_table}, step=iter_num)
+                        cosine_table.add_data(wandb_run_name, seed, idx, value)
+                    wandb.log({"hc/layer_cosine": cosine_table}, step=iter_num)
                 if wandb_log_layer_stats:
-                    layer_stats = collect_hc_layer_stats()
-                    layer_stats_table = build_layer_table(layer_stats)
+                    layer_rows = collect_hc_layer_stats()
+                    layer_stats_table = build_layer_table(
+                        layer_rows, wandb_run_name, seed
+                    )
                     if layer_stats_table is not None:
                         wandb.log({"hc/layer_stats": layer_stats_table}, step=iter_num)
             if losses["val"] < best_val_loss:

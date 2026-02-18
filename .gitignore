@@ -234,3 +234,9 @@ CLAUDE.md
 .claude
 *plan.md
 secret
+*.profile
+
+*wandb*
+*.png
+**/data/*
+!**/*.py
